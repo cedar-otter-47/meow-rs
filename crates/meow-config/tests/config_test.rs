@@ -21,6 +21,51 @@ mixed-port: 7890
 }
 
 #[tokio::test]
+async fn test_proxy_group_forward_reference_preserves_nested_group() {
+    let yaml = r#"
+proxies:
+  - name: node-a
+    type: socks5
+    server: 127.0.0.1
+    port: 10001
+  - name: node-b
+    type: socks5
+    server: 127.0.0.1
+    port: 10002
+
+proxy-groups:
+  - name: upper-selector
+    type: select
+    proxies:
+      - failover
+      - missing-upper-member
+  - name: failover
+    type: fallback
+    url: https://www.gstatic.com/generate_204
+    interval: 300
+    proxies:
+      - node-a
+      - node-b
+      - missing-fallback-member
+"#;
+
+    let config = load_config_from_str(yaml).await.unwrap();
+    let selector = config
+        .proxies
+        .get("upper-selector")
+        .expect("forward-referencing selector must be built");
+    let fallback = config
+        .proxies
+        .get("failover")
+        .expect("referenced fallback group must be built");
+
+    assert_eq!(selector.members().unwrap(), ["failover"]);
+    assert_eq!(selector.current().as_deref(), Some("failover"));
+    assert_eq!(fallback.members().unwrap(), ["node-a", "node-b"]);
+    assert_eq!(fallback.current().as_deref(), Some("node-a"));
+}
+
+#[tokio::test]
 async fn test_general_config_table() {
     struct Case {
         label: &'static str,
