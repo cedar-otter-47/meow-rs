@@ -964,6 +964,8 @@ fn rebuild_from_raw_impl(
     // Keep trying until no new groups are resolved.
     let declared_group_names: std::collections::HashSet<&str> =
         raw_groups.iter().map(|group| group.name.as_str()).collect();
+    let mut built_group_names: std::collections::HashSet<SmolStr> =
+        std::collections::HashSet::new();
     let mut remaining: Vec<&raw::RawProxyGroup> = raw_groups.iter().collect();
     let mut max_passes = remaining.len() + 1;
     while !remaining.is_empty() && max_passes > 0 {
@@ -978,7 +980,7 @@ fn rebuild_from_raw_impl(
                     .iter()
                     .any(|name| {
                         declared_group_names.contains(name.as_str())
-                            && !proxies.contains_key(name.as_str())
+                            && !built_group_names.contains(name.as_str())
                     });
             if has_unresolved_group {
                 still_remaining.push(*raw_group);
@@ -993,6 +995,7 @@ fn rebuild_from_raw_impl(
             ) {
                 Ok(group) => {
                     let name = SmolStr::from(group.name());
+                    built_group_names.insert(name.clone());
                     proxies.insert(name, group);
                 }
                 Err(_) => {
@@ -1001,10 +1004,10 @@ fn rebuild_from_raw_impl(
             }
         }
         if still_remaining.len() == remaining.len() {
-            // No progress — the remaining groups reference proxies that
-            // don't exist in this config at all (not a forward reference).
-            // Match upstream mihomo: warn-and-skip the missing members and
-            // build the group with whatever resolved.
+            // No progress — preserve meow-rs's existing lenient behavior by
+            // warning about unresolved members and building each group with
+            // whatever resolved. Unlike mihomo, which rejects missing static
+            // members, meow-rs does not fail the entire config here.
             for raw_group in &still_remaining {
                 match proxy_parser::parse_proxy_group_lenient_with_store(
                     raw_group,
