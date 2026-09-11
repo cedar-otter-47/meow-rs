@@ -962,13 +962,30 @@ fn rebuild_from_raw_impl(
 
     // Multi-pass group resolution: groups can reference other groups.
     // Keep trying until no new groups are resolved.
+    let declared_group_names: std::collections::HashSet<&str> =
+        raw_groups.iter().map(|group| group.name.as_str()).collect();
     let mut remaining: Vec<&raw::RawProxyGroup> = raw_groups.iter().collect();
     let mut max_passes = remaining.len() + 1;
     while !remaining.is_empty() && max_passes > 0 {
         max_passes -= 1;
         let mut still_remaining = Vec::new();
         for raw_group in &remaining {
-            match proxy_parser::parse_proxy_group_with_store(
+            let has_unresolved_group =
+                raw_group
+                    .proxies
+                    .as_deref()
+                    .unwrap_or(&[])
+                    .iter()
+                    .any(|name| {
+                        declared_group_names.contains(name.as_str())
+                            && !proxies.contains_key(name.as_str())
+                    });
+            if has_unresolved_group {
+                still_remaining.push(*raw_group);
+                continue;
+            }
+
+            match proxy_parser::parse_proxy_group_lenient_with_store(
                 raw_group,
                 &proxies,
                 providers,
