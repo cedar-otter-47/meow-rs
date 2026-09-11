@@ -106,8 +106,8 @@ mod blake3_ctx {
         flags: u8,
     ) -> [u32; 8] {
         let mut words = [0u32; 16];
-        for (w, b) in words.iter_mut().zip(block.chunks_exact(4)) {
-            *w = u32::from_le_bytes(b.try_into().unwrap());
+        for (w, b) in words.iter_mut().zip(block.as_chunks::<4>().0.iter()) {
+            *w = u32::from_le_bytes(*b);
         }
         let mut state = [
             cv[0],
@@ -169,8 +169,8 @@ mod blake3_ctx {
 
     fn words_to_bytes(w: [u32; 8]) -> [u8; 32] {
         let mut out = [0u8; 32];
-        for (b, word) in out.chunks_exact_mut(4).zip(w.iter()) {
-            b.copy_from_slice(&word.to_le_bytes());
+        for (b, word) in out.as_chunks_mut::<4>().0.iter_mut().zip(w.iter()) {
+            *b = word.to_le_bytes();
         }
         out
     }
