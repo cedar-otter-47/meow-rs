@@ -98,8 +98,12 @@ This section is normative for `crates/meow-tunnel/src/rule_ir.rs`.
 
 ### Construction
 
-- `CompiledRuleSet::build(rules)` must create exactly one slot for every source
-  rule.
+- `CompiledRuleSet::build(rules)` creates one slot per source rule that survives
+  the clean-up passes (never-match folding, same-adapter dedup/shadow/coverage,
+  and truncation after a `MATCH` whose target is predicate-guaranteed, i.e.
+  `DIRECT`). Passes may only drop a rule whose outcome is provably identical
+  under continue-on-missing-target semantics — a different adapter keeps the
+  rule live because a dead covering target falls through to it.
 - `slot.rule_index` must equal the source rule's position in `rules`.
 - Slot order must remain identical to source rule order. The IR may add indexes
   or choose a different scan plan, but it must not reorder slots.
@@ -167,8 +171,11 @@ Execution-plan selection is a compiler optimization over the same slots.
 
 ### Runtime Contract
 
-- `CompiledRuleSet::match_rules(metadata, rules)` must be called with the same
-  source rule list used to build the compiled rule set.
+- `CompiledRuleSet::match_rules(metadata, rules, target_exists)` must be called
+  with the same source rule list used to build the compiled rule set, plus a
+  registry-membership predicate (`&dyn Fn(&str) -> bool`). A matched slot whose
+  adapter name fails the predicate is warned and skipped, matching mihomo's
+  `continue` in `match()`.
 - Returned `CompiledMatchResult` should borrow from the compiled rule set or the
   source rule; the successful hot path should not allocate.
 - The IR must not mutate runtime state.
@@ -450,9 +457,9 @@ unbounded ordered scans.
 
 ### Match Time
 
-At runtime, `CompiledRuleSet::match_rules(metadata, rules)` creates one
-`MatchInput` view for the request and executes the compiled plan without
-rebuilding or mutating anything.
+At runtime, `CompiledRuleSet::match_rules(metadata, rules, target_exists)`
+creates one `MatchInput` view for the request and executes the compiled plan
+without rebuilding or mutating anything.
 
 `MatchInput` caches request fields that many opcodes need, starting with
 `metadata.rule_host()`. Lowered domain opcodes and the domain-index probe share
@@ -531,8 +538,12 @@ runtime still resolves it by name in the route snapshot's proxy map.
 
 ## Execution Algorithm
 
-`CompiledRuleSet::match_rules(metadata, rules)` preserves the ordered
-first-match semantics of `match_engine::match_rules`.
+`CompiledRuleSet::match_rules(metadata, rules, target_exists)` preserves the
+ordered first-match semantics of `match_engine::match_rules`, including the
+shared continue-on-missing-target rule (issue #513): a matched rule whose
+adapter name fails `target_exists` is skipped and the scan continues — under
+the indexed plan the tail scan re-evaluates trie-owned domain slots, so a
+second matching domain rule after a skipped hit still resolves.
 
 For `LinearScan`, execution is:
 
@@ -573,9 +584,13 @@ In `TunnelInner::match_adapter()`:
 3. `Rule` mode loads the current `RouteTable` snapshot.
 4. If any active rule needs process lookup, the metadata is enriched before
    matching.
-5. The tunnel calls `route.compiled_rules.match_rules(metadata, route.rules)`.
-6. On match, statistics are incremented from the returned `RuleType`, the proxy
-   is resolved by returned adapter name, and missing proxies fall back to DIRECT.
+5. The tunnel calls
+   `route.compiled_rules.match_rules(metadata, route.rules, target_exists)`
+   where `target_exists` checks the same route snapshot's proxy registry
+   (with `DIRECT` hard-coded as always present).
+6. On match, statistics are incremented from the returned `RuleType`, and the
+   proxy is resolved by the returned adapter name — already proven present by
+   the predicate, so a missing proxy is only a defensive fallback to DIRECT.
 7. On no match, the tunnel uses DIRECT.
 
 DNS/IP pre-resolution remains outside the IR. The IR consumes the `Metadata`

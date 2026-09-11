@@ -530,8 +530,11 @@ mod tests {
             rng_state
         };
         for len in [
-            0usize, 1, 63, 64, 65, 127, 1023, 1024, 1025, 1087, 2047, 2048, 2049, 3000, 4096, 8192,
+            0usize, 1, 63, 64, 65, 127, 1023, 1024, 1025, 1087, 2047, 2048, 2049, 3000, 4096,
+            7168,  // 7 chunks — popcount 3: exercises the final-fold re-push
+            15360, // 15 chunks — popcount 4: three re-push iterations
             16645, // VLESS rekey ctx: 5-byte header + a max-size record
+            8192,
         ] {
             // Valid UTF-8 by construction: ASCII bytes only.
             let ctx: String = (0..len)

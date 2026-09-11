@@ -103,24 +103,37 @@ pub fn parse_proxy(
     parse_proxy_with_dialer(config, &dialer, ipv6)
 }
 
+/// Whether `config` describes an `ss` node whose `plugin:` names an external
+/// SIP003 executable — i.e. one that would reach `Command::new` during
+/// adapter construction. Gates untrusted node sources (proxy-providers,
+/// subscriptions) before the trusted local path (issue #513).
+pub fn node_selects_external_plugin(config: &HashMap<String, serde_yaml::Value>) -> bool {
+    #[cfg(feature = "ss")]
+    {
+        config.get("type").and_then(|v| v.as_str()) == Some("ss")
+            && is_external_sip003_plugin(config.get("plugin").and_then(|v| v.as_str()))
+    }
+    #[cfg(not(feature = "ss"))]
+    {
+        let _ = config;
+        false
+    }
+}
+
 /// [`parse_proxy`] for remote-controlled input (proxy-provider payloads).
 ///
 /// Without `allow_external_plugin`, an `ss` node whose `plugin:` names an
 /// external SIP003 executable is rejected: that name reaches `Command::new`
 /// during adapter construction, so provider content would select a local
-/// binary (issue #513). Built-in/in-process plugins (`obfs-local`,
-/// `v2ray-plugin`, `ech-tls-tunnel`) stay allowed — mihomo implements those
-/// in-process too, so gating them would diverge.
+/// binary (issue #513). Built-in/in-process plugins (`obfs`,
+/// `simple-obfs`, `v2ray-plugin`, `ech-tls-tunnel`) stay allowed — mihomo
+/// implements those in-process too, so gating them would diverge.
 pub fn parse_proxy_provider_node(
     config: &HashMap<String, serde_yaml::Value>,
     ipv6: bool,
     allow_external_plugin: bool,
 ) -> std::result::Result<Arc<dyn Proxy>, String> {
-    #[cfg(feature = "ss")]
-    if !allow_external_plugin
-        && config.get("type").and_then(|v| v.as_str()) == Some("ss")
-        && is_external_sip003_plugin(config.get("plugin").and_then(|v| v.as_str()))
-    {
+    if !allow_external_plugin && node_selects_external_plugin(config) {
         let name = config.get("name").and_then(|v| v.as_str()).unwrap_or("?");
         let plugin = config.get("plugin").and_then(|v| v.as_str()).unwrap_or("");
         return Err(format!(
@@ -3604,5 +3617,49 @@ tls: true
             "name: t\ntype: trojan\nserver: 1.2.3.4\nport: 443\npassword: p\nplugin: whatever\n",
         );
         assert!(super::parse_proxy_provider_node(&cfg, true, false).is_ok());
+    }
+
+    /// v2ray-plugin is a built-in in-process plugin — the gate must let it
+    /// through on provider nodes too.
+    #[cfg(feature = "ss")]
+    #[test]
+    fn provider_node_allows_v2ray_plugin() {
+        let cfg = proxy_config(
+            "name: s\ntype: ss\nserver: 1.2.3.4\nport: 8388\npassword: p\ncipher: aes-128-gcm\n\
+             plugin: v2ray-plugin\n",
+        );
+        assert!(super::parse_proxy_provider_node(&cfg, true, false).is_ok());
+    }
+
+    /// The provider opt-in key is `allow-external-plugin` (kebab-case like
+    /// the rest of `RawProxyProvider`) — a rename regression would leave the
+    /// gate permanently closed for users who set it.
+    #[test]
+    fn provider_allow_external_plugin_uses_kebab_case() {
+        let raw: crate::raw::RawProxyProvider =
+            serde_yaml::from_str("type: file\npath: p.yaml\nallow-external-plugin: true\n")
+                .unwrap();
+        assert_eq!(raw.allow_external_plugin, Some(true));
+    }
+
+    /// Subscriptions land remote nodes in the trusted `proxies:` list —
+    /// `parse_subscription_yaml` must drop external-SIP003 nodes before they
+    /// reach `Command::new`, while keeping built-in plugins.
+    #[cfg(feature = "ss")]
+    #[test]
+    fn subscription_drops_external_plugin_nodes() {
+        let text = "proxies:\n\
+             - name: evil\n  type: ss\n  server: 1.2.3.4\n  port: 8388\n  \
+             password: p\n  cipher: aes-128-gcm\n  plugin: evil-plugin\n\
+             - name: ok\n  type: ss\n  server: 1.2.3.4\n  port: 8389\n  \
+             password: p\n  cipher: aes-128-gcm\n  plugin: v2ray-plugin\n\
+             - name: plain\n  type: trojan\n  server: 1.2.3.4\n  port: 443\n  password: p\n";
+        let data = crate::subscription::parse_subscription_yaml(text).unwrap();
+        let names: Vec<&str> = data
+            .proxies
+            .iter()
+            .filter_map(|p| p.get("name").and_then(|v| v.as_str()))
+            .collect();
+        assert_eq!(names, ["ok", "plain"], "dropped: {names:?}");
     }
 }

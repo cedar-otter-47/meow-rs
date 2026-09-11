@@ -38,9 +38,24 @@ pub fn spawn_vmess_relay(
                 return;
             }
 
-            while let Ok(plaintext) = read_cipher.read_record(&mut rd).await {
-                if proxy_wr.write_all(&plaintext).await.is_err() {
-                    break;
+            loop {
+                match read_cipher.read_record(&mut rd).await {
+                    Ok(plaintext) => {
+                        if proxy_wr.write_all(&plaintext).await.is_err() {
+                            break;
+                        }
+                    }
+                    // UnexpectedEof is the ordinary close path (peer FIN or a
+                    // zero-length terminator record) — not worth a warn. The
+                    // rest covers decrypt failures and nonce-budget
+                    // exhaustion (issue #513), which otherwise look like an
+                    // unexplained ~1 GiB disconnect.
+                    Err(e) => {
+                        if e.kind() != std::io::ErrorKind::UnexpectedEof {
+                            tracing::warn!("vmess: read side closed: {e}");
+                        }
+                        break;
+                    }
                 }
             }
             let _ = proxy_wr.shutdown().await;
@@ -54,7 +69,10 @@ pub fn spawn_vmess_relay(
                     Ok(0) | Err(_) => break,
                     Ok(n) => n,
                 };
-                if write_cipher.write_record(&mut wr, &buf[..n]).await.is_err() {
+                if let Err(e) = write_cipher.write_record(&mut wr, &buf[..n]).await {
+                    // Same visibility: seal failure or nonce-budget
+                    // exhaustion (issue #513).
+                    tracing::warn!("vmess: write side closed: {e}");
                     break;
                 }
             }

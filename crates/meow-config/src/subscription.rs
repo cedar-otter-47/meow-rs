@@ -49,6 +49,22 @@ pub fn parse_subscription_yaml(text: &str) -> Result<SubscriptionData, anyhow::E
                 .iter()
                 .filter_map(|(k, v)| k.as_str().map(|ks| (ks.to_string(), v.clone())))
                 .collect();
+            // Subscription content is remote-controlled and lands in the
+            // trusted `proxies:` list, where an `ss` node's `plugin:` would
+            // reach `Command::new` — drop external-SIP003 nodes here
+            // (issue #513). No opt-in: a local plugin belongs in local
+            // config.
+            if crate::proxy_parser::node_selects_external_plugin(&hm) {
+                let name = hm.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                let plugin = hm.get("plugin").and_then(|v| v.as_str()).unwrap_or("");
+                tracing::warn!(
+                    "subscription node '{name}': dropping external SIP003 plugin \
+                     '{plugin}' (would spawn a local executable selected by \
+                     remote content); declare the node in local config if \
+                     intended"
+                );
+                continue;
+            }
             proxies.push(hm);
         }
     }
