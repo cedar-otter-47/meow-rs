@@ -38,6 +38,7 @@ proxy-groups:
     type: select
     proxies:
       - failover
+      # Preserve the existing lenient behavior in the referencing group too.
       - missing-upper-member
   - name: failover
     type: fallback
@@ -46,6 +47,8 @@ proxy-groups:
     proxies:
       - node-a
       - node-b
+      # This missing member prevented the referenced group from resolving in
+      # the strict pass and triggered the forward-reference regression.
       - missing-fallback-member
 "#;
 
@@ -63,6 +66,46 @@ proxy-groups:
     assert_eq!(selector.current().as_deref(), Some("failover"));
     assert_eq!(fallback.members().unwrap(), ["node-a", "node-b"]);
     assert_eq!(fallback.current().as_deref(), Some("node-a"));
+}
+
+#[tokio::test]
+async fn test_forward_group_reference_uses_group_when_leaf_has_same_name() {
+    let yaml = r#"
+proxies:
+  - name: child
+    type: socks5
+    server: 127.0.0.1
+    port: 10001
+  - name: node-a
+    type: socks5
+    server: 127.0.0.1
+    port: 10002
+
+proxy-groups:
+  - name: parent
+    type: select
+    proxies:
+      - child
+  - name: child
+    type: select
+    proxies:
+      - node-a
+"#;
+
+    let config = load_config_from_str(yaml).await.unwrap();
+    let parent = config.proxies.get("parent").expect("parent must be built");
+    let child = config
+        .proxies
+        .get("child")
+        .expect("child group must replace the same-named leaf");
+    let parent_member = parent
+        .unwrap_proxy(&meow_common::Metadata::default())
+        .expect("parent must select its child member");
+
+    assert!(
+        std::sync::Arc::ptr_eq(&parent_member, child),
+        "parent must retain the child group, not the superseded same-named leaf"
+    );
 }
 
 #[tokio::test]
