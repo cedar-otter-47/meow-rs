@@ -103,6 +103,38 @@ async fn native_x25519_1rtt() {
     run_case("native", KeySpec::X25519).await;
 }
 
+/// Same handshake over a real socket: `TcpStream` already implements `Stream`
+/// via the blanket impl, and a real NIC path adds buffering/segmentation the
+/// in-memory duplex never produces.
+#[tokio::test]
+async fn native_x25519_1rtt_over_tcp() {
+    let keys = make_keys(&KeySpec::X25519);
+    let enc = client_encryption_string("native", "1rtt", &keys);
+    let client = parse_client_encryption(&enc).unwrap().unwrap();
+    let server = Arc::new(ServerInstance::init(keys, 0, 0, 0, "").unwrap());
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server_task = tokio::spawn(async move {
+        let (raw, _) = listener.accept().await.unwrap();
+        server.handshake(Box::new(raw)).await.expect("server")
+    });
+    let c_raw = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let mut c = client.handshake(Box::new(c_raw)).await.expect("client");
+
+    c.write_all(b"ping over real tcp").await.unwrap();
+    c.flush().await.unwrap();
+    let mut s = server_task.await.expect("server task");
+    let mut buf = [0u8; 18];
+    s.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, b"ping over real tcp");
+    s.write_all(b"pong back").await.unwrap();
+    s.flush().await.unwrap();
+    let mut buf2 = [0u8; 9];
+    c.read_exact(&mut buf2).await.unwrap();
+    assert_eq!(&buf2, b"pong back");
+}
+
 #[tokio::test]
 async fn native_mlkem_1rtt() {
     run_case("native", KeySpec::MlKem).await;
