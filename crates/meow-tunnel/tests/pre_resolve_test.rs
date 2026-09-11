@@ -28,6 +28,13 @@ async fn pre_resolve_populates_dst_ip_for_ipcidr_rule() {
     let resolver = build_resolver_with_host("example.test", real_ip);
     let tunnel = Tunnel::new(resolver);
 
+    // A rule scan skips a match whose target is absent from the registry
+    // (issue #513), so publish a `PROXY` entry the rule can resolve to.
+    let cfg: meow_config::raw::RawConfig =
+        serde_yaml::from_str("proxies:\n  - name: PROXY\n    type: direct\n").unwrap();
+    let (proxies, _) = meow_config::rebuild_from_raw(&cfg).unwrap();
+    tunnel.update_proxies(proxies);
+
     let rule: Box<dyn Rule> =
         Box::new(IpCidrRule::new("1.2.3.0/24", "PROXY", false, false).unwrap());
     tunnel.update_rules(vec![rule]);

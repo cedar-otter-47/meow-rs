@@ -155,15 +155,15 @@ fn measure_hot_loop(
                         std::hint::black_box(metadata),
                         std::hint::black_box(rules),
                         std::hint::black_box(index),
+                        &|_| true,
                     ));
                 }
                 Matcher::Ir => {
-                    std::hint::black_box(
-                        compiled.match_rules(
-                            std::hint::black_box(metadata),
-                            std::hint::black_box(rules),
-                        ),
-                    );
+                    std::hint::black_box(compiled.match_rules(
+                        std::hint::black_box(metadata),
+                        std::hint::black_box(rules),
+                        &|_| true,
+                    ));
                 }
             }
         }

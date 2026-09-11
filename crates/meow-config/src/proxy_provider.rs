@@ -30,6 +30,10 @@ pub struct ProxyProvider {
     updated_at: AtomicU,
     header: HashMap<String, String>,
     ipv6: bool,
+    /// Whether `plugin:` on provider-sourced nodes may name an external
+    /// SIP003 executable. Provider content is remote-controlled; without the
+    /// opt-in such nodes are rejected before reaching `Command::new`.
+    allow_external_plugin: bool,
     /// Group-level filtered views of `slot` (issue #358), re-populated on
     /// every refresh. Weak: each view is kept alive by the group built from
     /// it, so views belonging to dropped or rebuilt groups get pruned here.
@@ -199,6 +203,7 @@ impl ProxyProvider {
             updated_at: AtomicU::new(0),
             header,
             ipv6,
+            allow_external_plugin: raw.allow_external_plugin.unwrap_or(false),
             derived: RwLock::new(Vec::new()),
         })
     }
@@ -326,7 +331,11 @@ impl ProxyProvider {
                 continue;
             }
 
-            match proxy_parser::parse_proxy(raw_map, self.ipv6) {
+            match proxy_parser::parse_proxy_provider_node(
+                raw_map,
+                self.ipv6,
+                self.allow_external_plugin,
+            ) {
                 Ok(proxy) => result.push(proxy),
                 Err(e) => {
                     warn!(provider = %self.name, proxy = raw_name, error = %e, "failed to parse proxy");
@@ -496,6 +505,7 @@ mod tests {
             exclude_type: None,
             health_check: None,
             header: None,
+            allow_external_plugin: None,
         }
     }
 
@@ -543,6 +553,7 @@ mod tests {
             exclude_type: None,
             health_check: None,
             header: None,
+            allow_external_plugin: None,
         };
         let Err(err) = ProxyProvider::new("test", &raw, Some(dir.path()), true) else {
             panic!("escaping http cache path must be rejected");
@@ -583,6 +594,7 @@ mod tests {
                 exclude_type: None,
                 health_check: None,
                 header: None,
+                allow_external_plugin: None,
             },
         );
         validate_paths(&map, Some(dir.path())).expect("contained paths must validate");
@@ -604,6 +616,7 @@ mod tests {
             exclude_type: None,
             health_check: None,
             header: Some(headers),
+            allow_external_plugin: None,
         };
         let p = ProxyProvider::new("airport", &raw, None, true).unwrap();
         assert_eq!(p.vehicle_type, "HTTP");

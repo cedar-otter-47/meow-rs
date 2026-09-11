@@ -418,6 +418,12 @@ pub struct RawProxyProvider {
     pub health_check: Option<RawHealthCheck>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub header: Option<std::collections::HashMap<String, String>>,
+    /// Opt-in: allow `plugin:` fields on this provider's nodes to name
+    /// external SIP003 executables. Off by default — provider content is
+    /// remote-controlled and the plugin name reaches `Command::new`
+    /// (issue #513). mihomo has no external-plugin mechanism, so no
+    /// mihomo subscription relies on it.
+    pub allow_external_plugin: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

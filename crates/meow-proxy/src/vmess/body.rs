@@ -117,14 +117,25 @@ fn record_nonce(iv: &[u8; 16], counter: u16) -> [u8; 12] {
 }
 
 /// Per-connection body cipher state for both directions.
+///
+/// `*_counter` is one past the last nonce value used. The wire format packs
+/// it into a u16, so record `0xFFFF` is the last safe one — a 65537th record
+/// would reuse nonce 0 under the same key. Reaching `NONCE_BUDGET` retires
+/// the connection (issue #513): the error propagates up the stream and the
+/// flow re-dials. mihomo shares this wrap (v2fly `aead.go`), so a >~1 GiB
+/// transfer on one connection is a deliberate divergence from upstream.
 pub struct BodyCipher {
     write: RecordCipher,
     write_iv: [u8; 16],
     read: RecordCipher,
     read_iv: [u8; 16],
-    write_counter: u16,
-    read_counter: u16,
+    write_counter: u32,
+    read_counter: u32,
 }
+
+/// Number of distinct nonces a u16 counter can produce. Mux logical flows
+/// share this budget because they share the physical connection's keys.
+const NONCE_BUDGET: u32 = 1 << 16;
 
 impl BodyCipher {
     pub fn new(security: Security, req_key: &[u8; 16], req_iv: &[u8; 16], resp_v: u8) -> Self {
@@ -152,16 +163,26 @@ impl BodyCipher {
         self.read_counter = self.write_counter;
     }
 
-    fn write_nonce(&mut self) -> [u8; 12] {
-        let nonce = record_nonce(&self.write_iv, self.write_counter);
-        self.write_counter = self.write_counter.wrapping_add(1);
-        nonce
+    fn write_nonce(&mut self) -> std::io::Result<[u8; 12]> {
+        if self.write_counter >= NONCE_BUDGET {
+            return Err(std::io::Error::other(
+                "vmess body nonce budget exhausted; retiring connection",
+            ));
+        }
+        let nonce = record_nonce(&self.write_iv, self.write_counter as u16);
+        self.write_counter += 1;
+        Ok(nonce)
     }
 
-    fn read_nonce(&mut self) -> [u8; 12] {
-        let nonce = record_nonce(&self.read_iv, self.read_counter);
-        self.read_counter = self.read_counter.wrapping_add(1);
-        nonce
+    fn read_nonce(&mut self) -> std::io::Result<[u8; 12]> {
+        if self.read_counter >= NONCE_BUDGET {
+            return Err(std::io::Error::other(
+                "vmess body nonce budget exhausted; retiring connection",
+            ));
+        }
+        let nonce = record_nonce(&self.read_iv, self.read_counter as u16);
+        self.read_counter += 1;
+        Ok(nonce)
     }
 
     /// Encrypt and write one body record: [len(2 BE)][ciphertext + tag(16)].
@@ -181,7 +202,7 @@ impl BodyCipher {
             return writer.flush().await;
         }
 
-        let nonce = self.write_nonce();
+        let nonce = self.write_nonce()?;
         let ct = self.write.seal(&nonce, plaintext)?;
         let len = ct.len() as u16;
         writer.write_all(&len.to_be_bytes()).await?;
@@ -214,7 +235,7 @@ impl BodyCipher {
         }
         let mut ct = vec![0u8; ct_len];
         reader.read_exact(&mut ct).await?;
-        let nonce = self.read_nonce();
+        let nonce = self.read_nonce()?;
         self.read.open(&nonce, &ct)
     }
 
@@ -293,8 +314,46 @@ mod tests {
 
         let (req_key, _) = test_keys();
         let mut cipher = BodyCipher::new(Security::Aes128Gcm, &req_key, &iv, 0x42);
-        assert_eq!(cipher.write_nonce()[..2], [0, 0]);
-        assert_eq!(cipher.write_nonce()[..2], [0, 1]);
+        assert_eq!(cipher.write_nonce().unwrap()[..2], [0, 0]);
+        assert_eq!(cipher.write_nonce().unwrap()[..2], [0, 1]);
+    }
+
+    /// Record 0xFFFF is the last safe nonce; the 65537th record must error
+    /// (retiring the connection) rather than reuse nonce 0 under the same key.
+    /// Both AEAD suites and both directions — mux flows share the physical
+    /// connection's BodyCipher, so this is the shared budget too.
+    async fn nonce_budget_retires_instead_of_reusing() {
+        let (req_key, req_iv) = test_keys();
+        for security in [Security::Aes128Gcm, Security::ChaCha20Poly1305] {
+            // Write direction.
+            let mut c = BodyCipher::new(security, &req_key, &req_iv, 0x42);
+            c.write_counter = NONCE_BUDGET - 1;
+            let mut wire = Vec::new();
+            c.write_record(&mut wire, b"last").await.unwrap();
+            let err = c
+                .write_record(&mut wire, b"one too many")
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("nonce budget exhausted"));
+
+            // Read direction: a peer that keeps sending past the budget must
+            // be refused, not decrypted under a reused nonce.
+            let mut c = BodyCipher::new(security, &req_key, &req_iv, 0x42);
+            c.mirror_write_to_read();
+            c.read_counter = NONCE_BUDGET - 1;
+            c.write_counter = NONCE_BUDGET - 1;
+            let mut wire = Vec::new();
+            c.write_record(&mut wire, b"last").await.unwrap();
+            let mut cursor = std::io::Cursor::new(wire);
+            assert_eq!(c.read_record(&mut cursor).await.unwrap(), b"last");
+            // The next read would need nonce 0 again.
+            let mut more = Vec::new();
+            let mut c2 = BodyCipher::new(security, &req_key, &req_iv, 0x42);
+            c2.write_record(&mut more, b"overflow").await.unwrap();
+            let mut cursor = std::io::Cursor::new(more);
+            let err = c.read_record(&mut cursor).await.unwrap_err();
+            assert!(err.to_string().contains("nonce budget exhausted"));
+        }
     }
 
     /// End-to-end read-direction interop: a hand-rolled "server" encrypts a
@@ -334,5 +393,6 @@ mod tests {
         body_key_derivation_matches_protocol();
         record_nonce_overwrites_iv_prefix_and_increments();
         read_record_decrypts_independently_encoded_response().await;
+        nonce_budget_retires_instead_of_reusing().await;
     }
 }

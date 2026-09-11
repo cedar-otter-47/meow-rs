@@ -1,18 +1,13 @@
-//! A matched rule whose target the registry does not hold falls back to
-//! DIRECT — no longer silently (issue #513).
+//! A matched rule whose target the registry does not hold is *skipped*, and
+//! the scan continues — mihomo's `match()` does `continue` on
+//! `proxies[adapter] == nil`, reaching DIRECT only via the no-match tail
+//! (issue #513).
 //!
-//! Note the deliberate deviation from upstream mihomo: its match loop *skips*
-//! a rule whose target is absent and keeps scanning later rules, reaching
-//! DIRECT only via the no-match tail (and reporting no rule). meow-rs stops at
-//! the first match and dials DIRECT — a subscription that dropped one node
-//! keeps routing the rest, but a later rule upstream would have matched is
-//! never consulted. The semantic parity question is a separate follow-up;
-//! what this port got wrong regardless is that nothing said so. The log line
-//! was a `debug!`, invisible at the default level, and the match statistics
-//! derived their action label from the target *name* before the lookup ran,
-//! so a rule naming `ghost-group` was counted as a PROXY hop that never
-//! happened while the bytes left the machine over the direct adapter. These
-//! tests pin the observable half — same DIRECT dial, honest counter.
+//! Before this change meow-rs stopped at the first match and silently
+//! substituted DIRECT: a subscription that dropped one node could bypass a
+//! later REJECT upstream would have honored. The scan now mirrors upstream,
+//! and the skip still warns — the /logs broadcast keeps only the message
+//! field, so target and rule type are interpolated into the message text.
 
 use meow_common::{AdapterType, DnsMode, Metadata, Network, Rule, TunnelMode};
 use meow_dns::Resolver;
@@ -62,53 +57,78 @@ fn tunnel_with_ghost_target() -> Tunnel {
 }
 
 #[test]
-fn a_matched_rule_with_a_missing_target_still_dials_direct() {
+fn a_matched_rule_with_a_missing_target_is_skipped_to_the_tail() {
     let tunnel = tunnel_with_ghost_target();
 
     let (proxy, rule, _payload) = tunnel
         .inner()
         .resolve_proxy(&metadata())
-        .expect("a MATCH rule always resolves");
+        .expect("the no-match tail always resolves");
 
-    assert_eq!(rule, "MATCH");
-    assert_eq!(
-        proxy.adapter_type(),
-        AdapterType::Direct,
-        "meow-rs dials DIRECT here; upstream instead skips the rule and keeps matching"
-    );
+    // The MATCH was skipped, not honored: nothing matched, so the reported
+    // rule is the no-match tail and the dial is DIRECT — exactly what
+    // upstream produces for `MATCH,ghost`.
+    assert_eq!(rule, "Final");
+    assert_eq!(proxy.adapter_type(), AdapterType::Direct);
 }
 
 #[test]
-fn the_fallback_is_counted_as_the_direct_dial_it_actually_is() {
+fn a_skipped_match_does_not_count_as_a_rule_hit() {
     let tunnel = tunnel_with_ghost_target();
     tunnel
         .inner()
         .resolve_proxy(&metadata())
-        .expect("a MATCH rule always resolves");
+        .expect("the no-match tail always resolves");
 
+    assert!(
+        tunnel.statistics().rule_match.snapshot().is_empty(),
+        "a skipped rule must not be counted as a match — the DIRECT dial is the no-match tail"
+    );
+}
+
+/// The parity case: `DOMAIN,ads.x,ghost` followed by `DOMAIN,ads.x,REJECT`
+/// must refuse the connection, not silently direct-dial it.
+#[test]
+fn a_later_rule_still_matches_after_a_skipped_dead_target() {
+    let tunnel = tunnel_with_builtin_registry();
+    let rules: Vec<Box<dyn Rule>> = vec![
+        Box::new(meow_rules::domain::DomainRule::new(
+            "example.test",
+            "ghost-group",
+        )),
+        Box::new(FinalRule::new("REJECT")),
+    ];
+    tunnel.update_rules(rules);
+
+    let (proxy, rule, _payload) = tunnel
+        .inner()
+        .resolve_proxy(&metadata())
+        .expect("the FINAL rule resolves");
+
+    assert_eq!(rule, "MATCH");
     assert_eq!(
-        tunnel.statistics().rule_match.snapshot(),
-        vec![(("MATCH", "DIRECT"), 1)],
-        "the counter must not report a proxy hop that never happened"
+        proxy.adapter_type(),
+        AdapterType::Reject,
+        "upstream skips the dead-target rule and lands on the later match"
     );
 }
 
 #[tokio::test]
-async fn the_lazy_resolve_path_falls_back_the_same_way() {
+async fn the_lazy_resolve_path_skips_the_same_way() {
     let tunnel = tunnel_with_ghost_target();
 
     let mut md = metadata();
-    let (proxy, _rule, _payload) = tunnel
+    let (proxy, rule, _payload) = tunnel
         .inner()
         .resolve_proxy_lazy(&mut md)
         .await
-        .expect("a MATCH rule always resolves");
+        .expect("the no-match tail always resolves");
 
+    assert_eq!(rule, "Final");
     assert_eq!(proxy.adapter_type(), AdapterType::Direct);
-    assert_eq!(
-        tunnel.statistics().rule_match.snapshot(),
-        vec![(("MATCH", "DIRECT"), 1)],
-        "both resolve paths share `materialize_rule_match`, so both count alike"
+    assert!(
+        tunnel.statistics().rule_match.snapshot().is_empty(),
+        "both resolve paths share the skipping scan, so both report no match"
     );
 }
 
@@ -155,9 +175,8 @@ fn a_rule_naming_direct_needs_no_registry_entry() {
 
 #[test]
 fn no_rule_matching_still_falls_through_to_direct() {
-    // Only a *matched* rule with an unresolvable target is relabelled. Nothing
-    // matching at all is the ordinary end of the rule list, which has never
-    // touched the match counters.
+    // Nothing matching at all is the ordinary end of the rule list, which has
+    // never touched the match counters.
     let tunnel = tunnel_with_builtin_registry();
     let rules: Vec<Box<dyn Rule>> = vec![];
     tunnel.update_rules(rules);

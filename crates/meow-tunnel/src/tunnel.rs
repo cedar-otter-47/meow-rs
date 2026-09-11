@@ -197,9 +197,11 @@ impl TunnelInner {
                     None
                 };
                 let match_metadata = enriched.as_ref().unwrap_or(metadata);
-                let result = route
-                    .compiled_rules
-                    .match_rules(match_metadata, route.rules.as_ref());
+                let result = route.compiled_rules.match_rules(
+                    match_metadata,
+                    route.rules.as_ref(),
+                    &|name| name == "DIRECT" || route.proxies.contains_key(name),
+                );
                 Some(self.materialize_rule_match(&route, result))
             }
         }
@@ -229,8 +231,9 @@ impl TunnelInner {
         let route = self.route();
         match route
             .compiled_rules
-            .match_rules_lazy(metadata, route.rules.as_ref())
-        {
+            .match_rules_lazy(metadata, route.rules.as_ref(), &|name| {
+                name == "DIRECT" || route.proxies.contains_key(name)
+            }) {
             LazyMatchOutcome::Matched(m) => Some(self.materialize_rule_match(&route, Some(m))),
             LazyMatchOutcome::NoMatch => Some(self.materialize_rule_match(&route, None)),
             LazyMatchOutcome::NeedsEnrichment {
@@ -257,9 +260,11 @@ impl TunnelInner {
                     enriched.dst_ip = Some(ip);
                 }
                 let match_metadata = enriched.as_ref().unwrap_or(metadata);
-                let result = route
-                    .compiled_rules
-                    .match_rules(match_metadata, route.rules.as_ref());
+                let result = route.compiled_rules.match_rules(
+                    match_metadata,
+                    route.rules.as_ref(),
+                    &|name| name == "DIRECT" || route.proxies.contains_key(name),
+                );
                 Some(self.materialize_rule_match(&route, result))
             }
         }
@@ -288,14 +293,12 @@ impl TunnelInner {
                     // adapter for exactly this.
                     None if target == "DIRECT" => Arc::clone(&self.direct) as Arc<dyn ProxyAdapter>,
                     None => {
-                        // Deliberate deviation from upstream mihomo: its match
-                        // loop *skips* a rule whose target is absent and keeps
-                        // scanning (`continue`), reaching DIRECT only via the
-                        // no-match tail. meow-rs stops at the first match and
-                        // dials DIRECT — a subscription that dropped one node
-                        // keeps routing the rest, but a later rule upstream
-                        // would have matched is never consulted (issue #513;
-                        // skip-and-continue is tracked as a parity follow-up).
+                        // Defence in depth: the rule scans (both compiled and
+                        // legacy engines) already skip a match whose target is
+                        // absent — mihomo's `continue` semantics — so this arm
+                        // is unreachable for registry-missing targets. Keep it
+                        // for any future path that resolves a match without a
+                        // registry check (issue #513).
                         //
                         // What it must not do is hide the fallback — it was a
                         // `debug!` and `action` was derived from the name

@@ -29,15 +29,231 @@ const MAX_NONCE: [u8; 12] = [0xFF; 12];
 /// BLAKE3 keyed derivation with an arbitrary-bytes context.
 ///
 /// Go calls `blake3.DeriveKey(out, string(ctx), key)` where `ctx` is raw bytes
-/// (an IV, a public key, a record, …) reinterpreted as a Go string. BLAKE3's
-/// derive-key mode only ever feeds the context through `context.as_bytes()`, so
-/// viewing the same bytes as a `&str` reproduces the Go output exactly.
+/// (an IV, a public key, a record, …) reinterpreted as a Go string. The Rust
+/// `blake3` crate types the context as `&str` and offers no byte-context form
+/// of the DERIVE_KEY_CONTEXT-flagged context hash, so [`blake3_ctx`]
+/// reimplements just that one hash over bytes; the material stage then runs
+/// through the public hazmat API. Output is byte-for-byte Go-compatible.
 fn derive_key(ctx: &[u8], key_material: &[u8]) -> [u8; 32] {
-    // SAFETY: the bytes are used solely as hash input (`context.as_bytes()`);
-    // no UTF-8 invariant is relied upon downstream, so an unchecked view is
-    // sound and byte-for-byte equivalent to Go's `string(ctx)`.
-    let ctx_str = unsafe { std::str::from_utf8_unchecked(ctx) };
-    blake3::derive_key(ctx_str, key_material)
+    use blake3::hazmat::HasherExt;
+    let context_key = blake3_ctx::context_key(ctx);
+    let mut hasher = blake3::Hasher::new_from_context_key(&context_key);
+    hasher.update(key_material);
+    *hasher.finalize().as_bytes()
+}
+
+/// The one piece of `blake3::derive_key` the crate does not expose over bytes:
+/// `hash_derive_key_context(context)` — a normal BLAKE3 tree hash of the
+/// context, keyed by the IV, with `DERIVE_KEY_CONTEXT` set at every node.
+///
+/// Mirrors the portable reference (`compress_in_place`/`compress_xof`, the
+/// lazy-merge chunk tree): identical output to
+/// `blake3::hazmat::hash_derive_key_context` for every valid UTF-8 context,
+/// which the tests verify across chunk-boundary lengths.
+mod blake3_ctx {
+    const CHUNK_LEN: usize = 1024;
+    const BLOCK_LEN: usize = 64;
+    const IV: [u32; 8] = [
+        0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 0x510E527F, 0x9B05688C, 0x1F83D9AB,
+        0x5BE0CD19,
+    ];
+    const MSG_SCHEDULE: [[usize; 16]; 7] = [
+        [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+        [2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8],
+        [3, 4, 10, 12, 13, 2, 7, 14, 6, 5, 9, 0, 11, 15, 8, 1],
+        [10, 7, 12, 9, 14, 3, 13, 15, 4, 0, 11, 2, 5, 8, 1, 6],
+        [12, 13, 9, 11, 15, 10, 14, 8, 7, 2, 5, 3, 0, 1, 6, 4],
+        [9, 14, 11, 5, 8, 12, 15, 1, 13, 3, 0, 10, 2, 6, 4, 7],
+        [11, 15, 5, 0, 1, 9, 8, 6, 14, 10, 2, 12, 3, 4, 7, 13],
+    ];
+    const CHUNK_START: u8 = 1;
+    const CHUNK_END: u8 = 1 << 1;
+    const PARENT: u8 = 1 << 2;
+    const ROOT: u8 = 1 << 3;
+    const DERIVE_KEY_CONTEXT: u8 = 1 << 5;
+
+    #[inline(always)]
+    fn g(state: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize, x: u32, y: u32) {
+        state[a] = state[a].wrapping_add(state[b]).wrapping_add(x);
+        state[d] = (state[d] ^ state[a]).rotate_right(16);
+        state[c] = state[c].wrapping_add(state[d]);
+        state[b] = (state[b] ^ state[c]).rotate_right(12);
+        state[a] = state[a].wrapping_add(state[b]).wrapping_add(y);
+        state[d] = (state[d] ^ state[a]).rotate_right(8);
+        state[c] = state[c].wrapping_add(state[d]);
+        state[b] = (state[b] ^ state[c]).rotate_right(7);
+    }
+
+    fn round(state: &mut [u32; 16], msg: &[u32; 16], round: usize) {
+        let schedule = MSG_SCHEDULE[round];
+        g(state, 0, 4, 8, 12, msg[schedule[0]], msg[schedule[1]]);
+        g(state, 1, 5, 9, 13, msg[schedule[2]], msg[schedule[3]]);
+        g(state, 2, 6, 10, 14, msg[schedule[4]], msg[schedule[5]]);
+        g(state, 3, 7, 11, 15, msg[schedule[6]], msg[schedule[7]]);
+        g(state, 0, 5, 10, 15, msg[schedule[8]], msg[schedule[9]]);
+        g(state, 1, 6, 11, 12, msg[schedule[10]], msg[schedule[11]]);
+        g(state, 2, 7, 8, 13, msg[schedule[12]], msg[schedule[13]]);
+        g(state, 3, 4, 9, 14, msg[schedule[14]], msg[schedule[15]]);
+    }
+
+    /// `compress_pre` + the `state[i] ^= state[i + 8]` fold — i.e. the crate's
+    /// `compress_in_place`, returning the first eight words.
+    fn compress(
+        cv: [u32; 8],
+        block: &[u8; 64],
+        counter: u64,
+        block_len: u8,
+        flags: u8,
+    ) -> [u32; 8] {
+        let mut words = [0u32; 16];
+        for (w, b) in words.iter_mut().zip(block.chunks_exact(4)) {
+            *w = u32::from_le_bytes(b.try_into().unwrap());
+        }
+        let mut state = [
+            cv[0],
+            cv[1],
+            cv[2],
+            cv[3],
+            cv[4],
+            cv[5],
+            cv[6],
+            cv[7],
+            IV[0],
+            IV[1],
+            IV[2],
+            IV[3],
+            counter as u32,
+            (counter >> 32) as u32,
+            u32::from(block_len),
+            u32::from(flags),
+        ];
+        for r in 0..7 {
+            round(&mut state, &words, r);
+        }
+        let mut out = [0u32; 8];
+        for i in 0..8 {
+            out[i] = state[i] ^ state[i + 8];
+        }
+        out
+    }
+
+    /// One tree node: its final compress parameters (the crate's `Output`).
+    struct Node {
+        cv: [u32; 8],
+        block: [u8; 64],
+        block_len: u8,
+        counter: u64,
+        flags: u8,
+    }
+
+    impl Node {
+        fn cv_bytes(&self) -> [u8; 32] {
+            words_to_bytes(compress(
+                self.cv,
+                &self.block,
+                self.counter,
+                self.block_len,
+                self.flags,
+            ))
+        }
+        fn root_bytes(&self) -> [u8; 32] {
+            words_to_bytes(compress(
+                self.cv,
+                &self.block,
+                self.counter,
+                self.block_len,
+                self.flags | ROOT,
+            ))
+        }
+    }
+
+    fn words_to_bytes(w: [u32; 8]) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        for (b, word) in out.chunks_exact_mut(4).zip(w.iter()) {
+            b.copy_from_slice(&word.to_le_bytes());
+        }
+        out
+    }
+
+    /// The chunk node for `chunk` at `counter` — all blocks compressed into the
+    /// CV except the last, which stays buffered in the node (CHUNK_END flag).
+    fn chunk_node(chunk: &[u8], counter: u64) -> Node {
+        let mut cv = IV;
+        // All but the last block are compressed into the CV; the last stays
+        // buffered in the node. An empty chunk is a single zero-length block.
+        let blocks = chunk.len().div_ceil(BLOCK_LEN).max(1);
+        let buffered = blocks - 1;
+        for i in 0..buffered {
+            let mut block = [0u8; BLOCK_LEN];
+            block.copy_from_slice(&chunk[i * BLOCK_LEN..(i + 1) * BLOCK_LEN]);
+            let flags = DERIVE_KEY_CONTEXT | if i == 0 { CHUNK_START } else { 0 };
+            cv = compress(cv, &block, counter, BLOCK_LEN as u8, flags);
+        }
+        let mut block = [0u8; BLOCK_LEN];
+        let tail = &chunk[buffered * BLOCK_LEN..];
+        block[..tail.len()].copy_from_slice(tail);
+        Node {
+            cv,
+            block,
+            block_len: tail.len() as u8,
+            counter,
+            flags: DERIVE_KEY_CONTEXT | CHUNK_END | if buffered == 0 { CHUNK_START } else { 0 },
+        }
+    }
+
+    fn parent_node(left: &[u8; 32], right: &[u8; 32]) -> Node {
+        let mut block = [0u8; 64];
+        block[..32].copy_from_slice(left);
+        block[32..].copy_from_slice(right);
+        Node {
+            cv: IV,
+            block,
+            block_len: 64,
+            counter: 0,
+            flags: DERIVE_KEY_CONTEXT | PARENT,
+        }
+    }
+
+    /// BLAKE3(`ctx`) with `DERIVE_KEY_CONTEXT` — identical to
+    /// `blake3::hazmat::hash_derive_key_context` for any `&str`, but accepts
+    /// arbitrary bytes.
+    pub(super) fn context_key(ctx: &[u8]) -> [u8; 32] {
+        // One chunk per CHUNK_LEN bytes; an empty context still hashes one
+        // zero-length chunk (CHUNK_START | CHUNK_END, block_len 0).
+        let mut stack: Vec<Node> = Vec::new();
+        let chunks: Vec<&[u8]> = if ctx.is_empty() {
+            vec![&[]]
+        } else {
+            ctx.chunks(CHUNK_LEN).collect()
+        };
+        for (i, chunk) in chunks.iter().enumerate() {
+            let mut node = chunk_node(chunk, i as u64);
+            // Lazy-merge rule: after the nth chunk, fold subtrees while n is
+            // even — same tree shape as the reference implementation.
+            let mut total = i as u64 + 1;
+            while total.is_multiple_of(2) {
+                let left = stack.pop().expect("cv stack has a subtree to merge");
+                node = parent_node(&left.cv_bytes(), &node.cv_bytes());
+                total >>= 1;
+            }
+            stack.push(node);
+        }
+        // Fold the remaining subtree stack right-to-left; the last merge (or
+        // the single chunk itself) is the root.
+        loop {
+            let node = stack.pop().expect("at least one chunk exists");
+            match stack.pop() {
+                None => return node.root_bytes(),
+                Some(left) => {
+                    let merged = parent_node(&left.cv_bytes(), &node.cv_bytes());
+                    if stack.is_empty() {
+                        return merged.root_bytes();
+                    }
+                    stack.push(merged);
+                }
+            }
+        }
+    }
 }
 
 /// BLAKE3-256 hash — Go's `blake3.Sum256`.
@@ -299,6 +515,48 @@ mod tests {
         assert!(a.is_exhausted());
         a.increment_nonce();
         assert_eq!(a.nonce, [0u8; 12]);
+    }
+
+    /// The hand-rolled context hash must reproduce `blake3::derive_key`
+    /// bit-for-bit — checkable on any valid UTF-8 context, across every
+    /// chunk-boundary length and tree depth.
+    #[test]
+    fn byte_context_derive_matches_str_derive_key() {
+        let mut rng_state = 0x9E3779B97F4A7C15u64;
+        let mut next = || {
+            rng_state ^= rng_state << 13;
+            rng_state ^= rng_state >> 7;
+            rng_state ^= rng_state << 17;
+            rng_state
+        };
+        for len in [
+            0usize, 1, 63, 64, 65, 127, 1023, 1024, 1025, 1087, 2047, 2048, 2049, 3000, 4096, 8192,
+            16645, // VLESS rekey ctx: 5-byte header + a max-size record
+        ] {
+            // Valid UTF-8 by construction: ASCII bytes only.
+            let ctx: String = (0..len)
+                .map(|_| ((next() % 95) as u8 + 32) as char)
+                .collect();
+            let material: Vec<u8> = (0..64).map(|_| next() as u8).collect();
+            assert_eq!(
+                derive_key(ctx.as_bytes(), &material),
+                blake3::derive_key(&ctx, &material),
+                "context length {len}"
+            );
+        }
+    }
+
+    /// The whole point: contexts that are not UTF-8 (IVs, keys, ciphertext)
+    /// must not error or panic — and two different binary contexts derive
+    /// different keys.
+    #[test]
+    fn byte_context_derive_accepts_arbitrary_bytes() {
+        let a = derive_key(&[0xFF; 32], b"key");
+        let b = derive_key(&[0xFE; 32], b"key");
+        assert_ne!(a, b);
+        // ~16 KiB of invalid-UTF-8 bytes — exercises the multi-chunk tree.
+        let big = vec![0x80u8; 16 * 1024 + 7];
+        let _ = derive_key(&big, b"key");
     }
 
     #[test]

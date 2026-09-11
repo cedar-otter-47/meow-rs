@@ -125,10 +125,16 @@ fn indexable_pattern(payload: &str) -> bool {
 ///
 /// Pre-resolution of `metadata.dst_ip` from a hostname must happen before this
 /// function is called (see `TunnelInner::pre_resolve`).
+///
+/// `target_exists` reports whether a matched rule's target names a live
+/// registry entry. A match on a missing target is skipped and the scan
+/// continues — mihomo's `match()` does `continue` on `proxies[adapter] ==
+/// nil` (issue #513).
 pub fn match_rules<'rules>(
     metadata: &Metadata,
     rules: &'rules [Box<dyn Rule>],
     index: &DomainIndex,
+    target_exists: &dyn Fn(&str) -> bool,
 ) -> Option<MatchResult<'rules>> {
     let helper = RuleMatchHelper;
 
@@ -150,36 +156,58 @@ pub fn match_rules<'rules>(
 
     for rule in &rules[..scan_end] {
         if let Some(adapter_name) = rule.match_and_resolve(metadata, &helper) {
+            if target_exists(adapter_name) {
+                return Some(MatchResult {
+                    adapter_name,
+                    rule_type: rule.rule_type(),
+                    rule_payload: rule.payload(),
+                });
+            }
+            warn_missing_target(adapter_name, rule.as_ref());
+        }
+    }
+
+    // Return trie hit if it beat the linear scan. On a missing target the
+    // scan resumes *after* the hit rule, as upstream `continue` does.
+    let mut tail = scan_end;
+    if let Some(trie_idx) = trie_hit {
+        let rule = &rules[trie_idx];
+        let adapter_name = rule.adapter();
+        if target_exists(adapter_name) {
             return Some(MatchResult {
                 adapter_name,
                 rule_type: rule.rule_type(),
                 rule_payload: rule.payload(),
             });
         }
-    }
-
-    // Return trie hit if it beat the linear scan.
-    if let Some(trie_idx) = trie_hit {
-        let rule = &rules[trie_idx];
-        return Some(MatchResult {
-            adapter_name: rule.adapter(),
-            rule_type: rule.rule_type(),
-            rule_payload: rule.payload(),
-        });
+        warn_missing_target(adapter_name, rule.as_ref());
+        tail = trie_idx + 1;
     }
 
     // No match in [0..T]; continue scanning the remainder (trie miss path).
-    for rule in &rules[scan_end..] {
+    for rule in &rules[tail..] {
         if let Some(adapter_name) = rule.match_and_resolve(metadata, &helper) {
-            return Some(MatchResult {
-                adapter_name,
-                rule_type: rule.rule_type(),
-                rule_payload: rule.payload(),
-            });
+            if target_exists(adapter_name) {
+                return Some(MatchResult {
+                    adapter_name,
+                    rule_type: rule.rule_type(),
+                    rule_payload: rule.payload(),
+                });
+            }
+            warn_missing_target(adapter_name, rule.as_ref());
         }
     }
 
     None
+}
+
+/// Log a skipped match: the rule matched but its target is absent from the
+/// registry (issue #513).
+fn warn_missing_target(adapter_name: &str, rule: &dyn Rule) {
+    tracing::warn!(
+        "rule {} matched target '{adapter_name}' which is not in the registry; skipping it",
+        rule.rule_type().as_str(),
+    );
 }
 
 pub fn maybe_enrich_with_process(metadata: &Metadata) -> Option<Metadata> {
@@ -255,7 +283,8 @@ mod tests {
         let meta = base_metadata(local);
         let index = DomainIndex::build(&rules);
         let enriched = maybe_enrich_with_process(&meta).expect("process lookup must succeed");
-        let result = match_rules(&enriched, &rules, &index).expect("engine must return a match");
+        let result =
+            match_rules(&enriched, &rules, &index, &|_| true).expect("engine must return a match");
         assert_eq!(result.adapter_name, "Proxy");
         assert_eq!(result.rule_type.as_str(), "PROCESS-NAME");
     }
@@ -275,7 +304,8 @@ mod tests {
         let meta = base_metadata(local);
         let index = DomainIndex::build(&rules);
         let enriched = maybe_enrich_with_process(&meta).expect("process lookup must succeed");
-        let result = match_rules(&enriched, &rules, &index).expect("final rule should match");
+        let result =
+            match_rules(&enriched, &rules, &index, &|_| true).expect("final rule should match");
         assert_eq!(result.adapter_name, "DIRECT");
         assert_eq!(result.rule_type.as_str(), "MATCH");
     }
@@ -294,7 +324,8 @@ mod tests {
             dst_port: 443,
             ..Default::default()
         };
-        let result = match_rules(&meta, &rules, &index).expect("final rule should match");
+        let result =
+            match_rules(&meta, &rules, &index, &|_| true).expect("final rule should match");
         assert_eq!(result.adapter_name, "DIRECT");
     }
 
@@ -314,7 +345,7 @@ mod tests {
             dst_port: 443,
             ..Default::default()
         };
-        let result = match_rules(&meta, &rules, &index).expect("must match");
+        let result = match_rules(&meta, &rules, &index, &|_| true).expect("must match");
         assert_eq!(result.adapter_name, "Proxy");
         assert_eq!(result.rule_type.as_str(), "DOMAIN-SUFFIX");
     }
@@ -337,7 +368,7 @@ mod tests {
             dst_port: 443,
             ..Default::default()
         };
-        let result = match_rules(&meta, &rules, &index).expect("must match");
+        let result = match_rules(&meta, &rules, &index, &|_| true).expect("must match");
         assert_eq!(result.adapter_name, "Direct");
     }
 
@@ -365,7 +396,7 @@ mod tests {
             dst_port: 443,
             ..Default::default()
         };
-        let result = match_rules(&meta, &rules, &index).expect("must match");
+        let result = match_rules(&meta, &rules, &index, &|_| true).expect("must match");
         assert_eq!(
             result.adapter_name, "Broad",
             "first-match-wins: broader rule at lower index must take precedence"

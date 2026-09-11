@@ -20,6 +20,7 @@ use std::net::IpAddr;
 use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
+use tracing::warn;
 
 /// Below this size, trie probing costs more than it saves for common configs
 /// with early matches. Compile small configs to straight-line ordered IR scan.
@@ -270,6 +271,17 @@ fn process_missing(metadata: &Metadata) -> bool {
     metadata.process.is_empty() && metadata.src_ip.is_some() && metadata.src_port != 0
 }
 
+/// Log a skipped match: the rule matched but its target is absent from the
+/// registry. Interpolated into the message itself because the /logs
+/// broadcast forwards only the `message` field (issue #513).
+fn warn_missing_target(m: &CompiledMatchResult<'_>) {
+    warn!(
+        "rule {} matched target '{}' which is not in the registry; skipping it",
+        m.rule_type.as_str(),
+        m.adapter_name,
+    );
+}
+
 /// One borrowed result from a compiled rule-set match.
 pub struct CompiledMatchResult<'a> {
     pub adapter_name: &'a str,
@@ -467,10 +479,16 @@ impl CompiledRuleSet {
     /// `rules` must be the same rule slice this plan was built from. The plan
     /// stores rule indices rather than references so it can live beside an
     /// owned `Vec<Box<dyn Rule>>` in a route-table snapshot.
+    ///
+    /// `target_exists` reports whether a matched rule's target names a live
+    /// registry entry (DIRECT/REJECT/GLOBAL included). A match on a missing
+    /// target is skipped and the scan continues — mihomo's `match()` does
+    /// `continue` on `proxies[adapter] == nil` (issue #513).
     pub fn match_rules<'a>(
         &'a self,
         metadata: &Metadata,
         rules: &'a [Box<dyn Rule>],
+        target_exists: &dyn Fn(&str) -> bool,
     ) -> Option<CompiledMatchResult<'a>> {
         debug_assert_eq!(
             self.source_rule_count,
@@ -481,7 +499,7 @@ impl CompiledRuleSet {
         let helper = RuleMatchHelper;
         let input = MatchInput::new(metadata);
         if self.execution_plan == ExecutionPlan::LinearScan {
-            return self.scan_range(0..self.slots.len(), &input, rules, &helper);
+            return self.scan_range(0..self.slots.len(), &input, rules, &helper, target_exists);
         }
 
         let trie_hit = if input.host.is_empty() {
@@ -510,15 +528,29 @@ impl CompiledRuleSet {
             None => (self.slots.len(), None),
         };
 
-        if let Some(matched) = self.scan_range(0..scan_end, &input, rules, &helper) {
+        if let Some(matched) = self.scan_range(0..scan_end, &input, rules, &helper, target_exists) {
             return Some(matched);
         }
 
+        // Upstream `continue` semantics: a matched trie hit with a missing
+        // target is skipped and the scan resumes at the slot *after* it.
+        let mut tail_start = scan_end;
         if let Some(slot) = hit_slot {
-            return Some(self.static_match(slot));
+            let m = self.static_match(slot);
+            if target_exists(m.adapter_name) {
+                return Some(m);
+            }
+            warn_missing_target(&m);
+            tail_start += 1;
         }
 
-        self.scan_range(scan_end..self.slots.len(), &input, rules, &helper)
+        self.scan_range(
+            tail_start..self.slots.len(),
+            &input,
+            rules,
+            &helper,
+            target_exists,
+        )
     }
 
     /// Like [`Self::match_rules`], but with **demand-driven early stop**:
@@ -531,10 +563,13 @@ impl CompiledRuleSet {
     /// pre-resolution or a process-table walk. On
     /// [`LazyMatchOutcome::NeedsEnrichment`], materialize the reported
     /// fields and re-run [`Self::match_rules`] with the enriched metadata.
+    /// Same `target_exists` contract as [`Self::match_rules`]: matched slots
+    /// whose target is absent are skipped and the scan continues.
     pub fn match_rules_lazy<'a>(
         &'a self,
         metadata: &Metadata,
         rules: &'a [Box<dyn Rule>],
+        target_exists: &dyn Fn(&str) -> bool,
     ) -> LazyMatchOutcome<'a> {
         debug_assert_eq!(
             self.source_rule_count,
@@ -545,7 +580,13 @@ impl CompiledRuleSet {
         let helper = RuleMatchHelper;
         let input = MatchInput::new(metadata);
         if self.execution_plan == ExecutionPlan::LinearScan {
-            return match self.scan_range_ctl::<true>(0..self.slots.len(), &input, rules, &helper) {
+            return match self.scan_range_ctl::<true>(
+                0..self.slots.len(),
+                &input,
+                rules,
+                &helper,
+                target_exists,
+            ) {
                 ScanOutcome::Matched(matched) => LazyMatchOutcome::Matched(matched),
                 ScanOutcome::Blocked { pos } => self.enrichment_needs(pos, &input),
                 ScanOutcome::Exhausted => LazyMatchOutcome::NoMatch,
@@ -569,7 +610,7 @@ impl CompiledRuleSet {
             None => (self.slots.len(), None),
         };
 
-        match self.scan_range_ctl::<true>(0..scan_end, &input, rules, &helper) {
+        match self.scan_range_ctl::<true>(0..scan_end, &input, rules, &helper, target_exists) {
             ScanOutcome::Matched(matched) => return LazyMatchOutcome::Matched(matched),
             // A blocked slot before the trie hit may match and beat it, so
             // enrichment is needed even though a domain rule stands ready.
@@ -577,11 +618,23 @@ impl CompiledRuleSet {
             ScanOutcome::Exhausted => {}
         }
 
+        let mut tail_start = scan_end;
         if let Some(slot) = hit_slot {
-            return LazyMatchOutcome::Matched(self.static_match(slot));
+            let m = self.static_match(slot);
+            if target_exists(m.adapter_name) {
+                return LazyMatchOutcome::Matched(m);
+            }
+            warn_missing_target(&m);
+            tail_start += 1;
         }
 
-        match self.scan_range_ctl::<true>(scan_end..self.slots.len(), &input, rules, &helper) {
+        match self.scan_range_ctl::<true>(
+            tail_start..self.slots.len(),
+            &input,
+            rules,
+            &helper,
+            target_exists,
+        ) {
             ScanOutcome::Matched(matched) => LazyMatchOutcome::Matched(matched),
             ScanOutcome::Blocked { pos } => self.enrichment_needs(pos, &input),
             ScanOutcome::Exhausted => LazyMatchOutcome::NoMatch,
@@ -652,8 +705,9 @@ impl CompiledRuleSet {
         input: &MatchInput<'_>,
         rules: &'a [Box<dyn Rule>],
         helper: &RuleMatchHelper,
+        target_exists: &dyn Fn(&str) -> bool,
     ) -> Option<CompiledMatchResult<'a>> {
-        match self.scan_range_ctl::<false>(range, input, rules, helper) {
+        match self.scan_range_ctl::<false>(range, input, rules, helper, target_exists) {
             ScanOutcome::Matched(matched) => Some(matched),
             ScanOutcome::Blocked { .. } | ScanOutcome::Exhausted => None,
         }
@@ -663,12 +717,18 @@ impl CompiledRuleSet {
     /// to the original tight loop — no per-slot demand branch, no position
     /// bookkeeping (measured: the runtime-bool version cost ~2.5x on a 10k
     /// wildcard-rule miss scan).
+    ///
+    /// A matched slot whose target is absent from the registry is warned and
+    /// skipped (`continue`), matching mihomo's `match()` loop — one hash
+    /// lookup per *matching* slot only, so the miss-scan hot path is
+    /// unchanged (issue #513).
     fn scan_range_ctl<'a, const STOP_ON_DEMAND: bool>(
         &'a self,
         range: Range<usize>,
         input: &MatchInput<'_>,
         rules: &'a [Box<dyn Rule>],
         helper: &RuleMatchHelper,
+        target_exists: &dyn Fn(&str) -> bool,
     ) -> ScanOutcome<'a> {
         let start = range.start;
         for (offset, slot) in self.slots[range].iter().enumerate() {
@@ -677,39 +737,33 @@ impl CompiledRuleSet {
                     pos: start + offset,
                 };
             }
-            match &slot.op {
+            let matched = match &slot.op {
                 // Owned by the domain index: the trie already proved this
                 // slot does not match anywhere a scan range is consulted.
-                RuleOp::TrieOwned => {}
+                RuleOp::TrieOwned => None,
                 RuleOp::Fallback => {
                     let Some(rule) = rules.get(slot.rule_index) else {
                         return ScanOutcome::Exhausted;
                     };
                     match slot.target_plan {
-                        TargetPlan::StaticAdapter => {
-                            if rule.match_metadata(input.metadata, helper) {
-                                return ScanOutcome::Matched(self.static_match(slot));
-                            }
-                        }
-                        TargetPlan::DynamicAdapter => {
-                            if let Some(adapter_name) =
-                                rule.match_and_resolve(input.metadata, helper)
-                            {
+                        TargetPlan::StaticAdapter => rule
+                            .match_metadata(input.metadata, helper)
+                            .then(|| self.static_match(slot)),
+                        TargetPlan::DynamicAdapter => rule
+                            .match_and_resolve(input.metadata, helper)
+                            .map(|adapter_name| {
                                 let adapter_index = self.adapter_lookup.get(adapter_name).copied();
-                                return ScanOutcome::Matched(self.make_match(
-                                    slot,
-                                    adapter_name,
-                                    adapter_index,
-                                ));
-                            }
-                        }
+                                self.make_match(slot, adapter_name, adapter_index)
+                            }),
                     }
                 }
-                op => {
-                    if matches_op(op, input, helper) {
-                        return ScanOutcome::Matched(self.static_match(slot));
-                    }
+                op => matches_op(op, input, helper).then(|| self.static_match(slot)),
+            };
+            if let Some(m) = matched {
+                if target_exists(m.adapter_name) {
+                    return ScanOutcome::Matched(m);
                 }
+                warn_missing_target(&m);
             }
         }
         ScanOutcome::Exhausted
@@ -1797,7 +1851,9 @@ mod tests {
                 dst_port: 443,
                 ..Default::default()
             };
-            let result = set.match_rules(&meta, &rules).expect("must match");
+            let result = set
+                .match_rules(&meta, &rules, &|_| true)
+                .expect("must match");
             assert_eq!(result.adapter_name, expected, "host={host}");
         }
     }
@@ -1819,7 +1875,9 @@ mod tests {
             dst_port: 443,
             ..Default::default()
         };
-        let result = set.match_rules(&meta, &rules).expect("must match");
+        let result = set
+            .match_rules(&meta, &rules, &|_| true)
+            .expect("must match");
         assert_eq!(
             result.adapter_name, "Broad",
             "min-index trie semantics: earliest matching domain rule wins",
@@ -1841,7 +1899,9 @@ mod tests {
             dst_port: 443,
             ..Default::default()
         };
-        let result = set.match_rules(&hit_443, &rules).expect("must match");
+        let result = set
+            .match_rules(&hit_443, &rules, &|_| true)
+            .expect("must match");
         assert_eq!(result.adapter_name, "PortFirst");
 
         let hit_80 = Metadata {
@@ -1849,7 +1909,9 @@ mod tests {
             dst_port: 80,
             ..Default::default()
         };
-        let result = set.match_rules(&hit_80, &rules).expect("must match");
+        let result = set
+            .match_rules(&hit_80, &rules, &|_| true)
+            .expect("must match");
         assert_eq!(result.adapter_name, "P9");
     }
 
@@ -1887,7 +1949,9 @@ mod tests {
                 dst_port: 443,
                 ..Default::default()
             };
-            let result = set.match_rules(&meta, &rules).expect("must match");
+            let result = set
+                .match_rules(&meta, &rules, &|_| true)
+                .expect("must match");
             assert_eq!(result.adapter_name, expected, "host={host}");
         }
     }
@@ -1922,7 +1986,9 @@ mod tests {
                 dst_port: 443,
                 ..Default::default()
             };
-            let result = set.match_rules(&meta, &rules).expect("must match");
+            let result = set
+                .match_rules(&meta, &rules, &|_| true)
+                .expect("must match");
             assert_eq!(result.adapter_name, expected, "host={host}");
         }
     }
@@ -1983,7 +2049,9 @@ mod tests {
                 dst_port: 443,
                 ..Default::default()
             };
-            let compiled = set.match_rules(&meta, &rules).expect("must match");
+            let compiled = set
+                .match_rules(&meta, &rules, &|_| true)
+                .expect("must match");
             let (adapter, ..) = naive_match(&meta, &rules).expect("must match");
             assert_eq!(compiled.adapter_name, adapter, "host={host}");
         }
@@ -2044,7 +2112,9 @@ mod tests {
                 "DIRECT",
             ),
         ] {
-            let result = set.match_rules(&meta, &rules).expect("must match");
+            let result = set
+                .match_rules(&meta, &rules, &|_| true)
+                .expect("must match");
             assert_eq!(result.adapter_name, expected);
             let (adapter, ..) = naive_match(&meta, &rules).expect("must match");
             assert_eq!(result.adapter_name, adapter);
@@ -2094,7 +2164,9 @@ mod tests {
                 dst_port: 443,
                 ..Default::default()
             };
-            let result = set.match_rules(&meta, &rules).expect("must match");
+            let result = set
+                .match_rules(&meta, &rules, &|_| true)
+                .expect("must match");
             assert_eq!(result.adapter_name, expected, "dst={dst:?} src={src:?}");
             let (adapter, ..) = naive_match(&meta, &rules).expect("must match");
             assert_eq!(result.adapter_name, adapter, "dst={dst:?} src={src:?}");
@@ -2122,7 +2194,7 @@ mod tests {
         };
         assert!(
             matches!(
-                set.match_rules_lazy(&meta, &rules),
+                set.match_rules_lazy(&meta, &rules, &|_| true),
                 LazyMatchOutcome::NeedsEnrichment { needs_ip: true, .. }
             ),
             "lazy scan must stop for resolution instead of falling through",
@@ -2221,7 +2293,9 @@ mod tests {
                 dst_port: port,
                 ..Default::default()
             };
-            let result = set.match_rules(&meta, &rules).expect("must match");
+            let result = set
+                .match_rules(&meta, &rules, &|_| true)
+                .expect("must match");
             assert_eq!(result.adapter_name, expected, "port={port}");
             let (adapter, ..) = naive_match(&meta, &rules).expect("must match");
             assert_eq!(result.adapter_name, adapter, "port={port}");
@@ -2249,7 +2323,9 @@ mod tests {
             dst_port: 443,
             ..Default::default()
         };
-        let result = set.match_rules(&meta, &rules).expect("must match");
+        let result = set
+            .match_rules(&meta, &rules, &|_| true)
+            .expect("must match");
         assert_eq!(result.adapter_name, "A");
     }
 
@@ -2270,7 +2346,9 @@ mod tests {
             dst_port: 443,
             ..Default::default()
         };
-        let result = set.match_rules(&meta, &rules).expect("must match");
+        let result = set
+            .match_rules(&meta, &rules, &|_| true)
+            .expect("must match");
         assert_eq!(result.adapter_name, "Umlaut");
     }
 
@@ -2394,7 +2472,7 @@ mod tests {
 
                 let expected = naive_match(&metadata, &rules);
                 let actual = set
-                    .match_rules(&metadata, &rules)
+                    .match_rules(&metadata, &rules, &|_| true)
                     .map(|m| (m.adapter_name, m.rule_type, m.rule_payload));
                 assert_eq!(
                     actual, expected,
@@ -2418,7 +2496,7 @@ mod tests {
             dst_port: 443,
             ..Default::default()
         };
-        match set.match_rules_lazy(&meta, &rules) {
+        match set.match_rules_lazy(&meta, &rules, &|_| true) {
             LazyMatchOutcome::NeedsEnrichment {
                 needs_ip,
                 needs_process,
@@ -2444,7 +2522,7 @@ mod tests {
             dst_port: 443,
             ..Default::default()
         };
-        match set.match_rules_lazy(&meta, &rules) {
+        match set.match_rules_lazy(&meta, &rules, &|_| true) {
             LazyMatchOutcome::Matched(m) => assert_eq!(m.adapter_name, "DomainProxy"),
             _ => panic!("domain match must complete without enrichment"),
         }
@@ -2464,7 +2542,7 @@ mod tests {
             dst_port: 443,
             ..Default::default()
         };
-        match set.match_rules_lazy(&meta, &rules) {
+        match set.match_rules_lazy(&meta, &rules, &|_| true) {
             LazyMatchOutcome::Matched(m) => assert_eq!(m.adapter_name, "DIRECT"),
             _ => panic!("must fall through to FINAL without demanding enrichment"),
         }
@@ -2485,7 +2563,7 @@ mod tests {
             dst_port: 443,
             ..Default::default()
         };
-        match set.match_rules_lazy(&meta, &rules) {
+        match set.match_rules_lazy(&meta, &rules, &|_| true) {
             LazyMatchOutcome::Matched(m) => assert_eq!(m.adapter_name, "DIRECT"),
             _ => panic!("no-resolve rule must not demand enrichment"),
         }
@@ -2508,7 +2586,7 @@ mod tests {
             dst_port: 443,
             ..Default::default()
         };
-        match set.match_rules_lazy(&meta, &rules) {
+        match set.match_rules_lazy(&meta, &rules, &|_| true) {
             LazyMatchOutcome::NeedsEnrichment {
                 needs_ip,
                 needs_process,
@@ -2538,7 +2616,7 @@ mod tests {
             dst_port: 443,
             ..Default::default()
         };
-        match set.match_rules_lazy(&meta, &rules) {
+        match set.match_rules_lazy(&meta, &rules, &|_| true) {
             LazyMatchOutcome::NeedsEnrichment { needs_ip, .. } => assert!(needs_ip),
             _ => panic!("blocked slot before the trie hit must demand enrichment"),
         }
@@ -2551,7 +2629,9 @@ mod tests {
             dst_port: 443,
             ..Default::default()
         };
-        let result = set.match_rules(&resolved, &rules).expect("must match");
+        let result = set
+            .match_rules(&resolved, &rules, &|_| true)
+            .expect("must match");
         assert_eq!(result.adapter_name, "P7");
     }
 
@@ -2610,7 +2690,9 @@ mod tests {
             dst_port: 443,
             ..Default::default()
         };
-        let result = set.match_rules(&hit, &rules).expect("must match");
+        let result = set
+            .match_rules(&hit, &rules, &|_| true)
+            .expect("must match");
         assert_eq!(result.adapter_name, "GeoProxy");
         assert_eq!(result.rule_type, RuleType::GeoIp);
 
@@ -2619,7 +2701,9 @@ mod tests {
             dst_port: 443,
             ..Default::default()
         };
-        let result = set.match_rules(&miss, &rules).expect("must match");
+        let result = set
+            .match_rules(&miss, &rules, &|_| true)
+            .expect("must match");
         assert_eq!(result.adapter_name, "DIRECT");
     }
 
@@ -2640,7 +2724,9 @@ mod tests {
             dst_port: 443,
             ..Default::default()
         };
-        let result = set.match_rules(&hit, &rules).expect("must match");
+        let result = set
+            .match_rules(&hit, &rules, &|_| true)
+            .expect("must match");
         assert_eq!(result.adapter_name, "SuffixProxy");
 
         let miss = Metadata {
@@ -2648,7 +2734,9 @@ mod tests {
             dst_port: 443,
             ..Default::default()
         };
-        let result = set.match_rules(&miss, &rules).expect("must match");
+        let result = set
+            .match_rules(&miss, &rules, &|_| true)
+            .expect("must match");
         assert_eq!(result.adapter_name, "DIRECT");
     }
 
@@ -2681,7 +2769,9 @@ mod tests {
             dst_port: 443,
             ..Default::default()
         };
-        let result = set.match_rules(&hit, &rules).expect("must match");
+        let result = set
+            .match_rules(&hit, &rules, &|_| true)
+            .expect("must match");
         assert_eq!(result.adapter_name, "LogicProxy");
         assert_eq!(result.rule_type, RuleType::And);
 
@@ -2691,7 +2781,9 @@ mod tests {
             dst_port: 80,
             ..Default::default()
         };
-        let result = set.match_rules(&miss, &rules).expect("must match");
+        let result = set
+            .match_rules(&miss, &rules, &|_| true)
+            .expect("must match");
         assert_eq!(result.adapter_name, "DIRECT");
     }
 
@@ -2728,7 +2820,9 @@ mod tests {
             ..Default::default()
         };
         // The counting child always matches → OR matches via fallback.
-        let result = set.match_rules(&meta, &rules).expect("must match");
+        let result = set
+            .match_rules(&meta, &rules, &|_| true)
+            .expect("must match");
         assert_eq!(result.adapter_name, "MixedProxy");
     }
 
@@ -2754,7 +2848,9 @@ mod tests {
             dst_port: 443,
             ..Default::default()
         };
-        let result = set.match_rules(&meta, &rules).expect("FINAL must match");
+        let result = set
+            .match_rules(&meta, &rules, &|_| true)
+            .expect("FINAL must match");
         assert_eq!(result.adapter_name, "DIRECT");
         assert_eq!(result.rule_type, RuleType::Match);
     }
@@ -2776,7 +2872,9 @@ mod tests {
             dst_port: 443,
             ..Default::default()
         };
-        let result = set.match_rules(&meta, &rules).expect("domain must match");
+        let result = set
+            .match_rules(&meta, &rules, &|_| true)
+            .expect("domain must match");
         assert_eq!(result.adapter_name, "First", "first occurrence wins");
     }
 
@@ -2800,7 +2898,9 @@ mod tests {
             dst_port: 443,
             ..Default::default()
         };
-        let result = set.match_rules(&meta, &rules).expect("FINAL must match");
+        let result = set
+            .match_rules(&meta, &rules, &|_| true)
+            .expect("FINAL must match");
         assert_eq!(result.adapter_name, "DIRECT");
     }
 
@@ -2818,7 +2918,7 @@ mod tests {
 
         assert_eq!(set.len(), 1, "UID op is constant-false off Linux");
         let result = set
-            .match_rules(&Metadata::default(), &rules)
+            .match_rules(&Metadata::default(), &rules, &|_| true)
             .expect("FINAL must match");
         assert_eq!(result.adapter_name, "DIRECT");
     }
@@ -2874,7 +2974,7 @@ mod tests {
         };
 
         let result = set
-            .match_rules(&meta, &rules)
+            .match_rules(&meta, &rules, &|_| true)
             .expect("domain rule must match");
         assert_eq!(result.adapter_name, "Proxy");
         assert_eq!(result.rule_type, RuleType::DomainSuffix);
@@ -2898,7 +2998,7 @@ mod tests {
         };
 
         let result = set
-            .match_rules(&meta, &rules)
+            .match_rules(&meta, &rules, &|_| true)
             .expect("earlier port rule must match");
         assert_eq!(result.adapter_name, "Direct");
         assert_eq!(result.rule_type, RuleType::DstPort);
@@ -2919,7 +3019,7 @@ mod tests {
             ..Default::default()
         };
         let result = set
-            .match_rules(&meta, &rules)
+            .match_rules(&meta, &rules, &|_| true)
             .expect("port list must match");
         assert_eq!(result.adapter_name, "PortProxy");
         assert_eq!(result.rule_type, RuleType::DstPort);
@@ -2940,7 +3040,7 @@ mod tests {
             ..Default::default()
         };
         let result = set
-            .match_rules(&meta, &rules)
+            .match_rules(&meta, &rules, &|_| true)
             .expect("in-port list must match");
         assert_eq!(result.adapter_name, "InboundProxy");
         assert_eq!(result.rule_type, RuleType::InPort);
@@ -2967,7 +3067,7 @@ mod tests {
             ..Default::default()
         };
         let result = set
-            .match_rules(&meta, &rules)
+            .match_rules(&meta, &rules, &|_| true)
             .expect("geosite attr fallback must match");
         assert_eq!(result.adapter_name, "Direct");
         assert_eq!(result.rule_type, RuleType::GeoSite);
@@ -2995,7 +3095,7 @@ mod tests {
             ..Default::default()
         };
         let result = set
-            .match_rules(&meta, &rules)
+            .match_rules(&meta, &rules, &|_| true)
             .expect("geoip fallback must match");
         assert_eq!(result.adapter_name, "GeoProxy");
         assert_eq!(result.rule_type, RuleType::GeoIp);
@@ -3022,7 +3122,7 @@ mod tests {
             ..Default::default()
         };
         let result = compiled
-            .match_rules(&meta, &rules)
+            .match_rules(&meta, &rules, &|_| true)
             .expect("rule-set op must match");
         assert_eq!(result.adapter_name, "Direct");
         assert_eq!(result.rule_type, RuleType::RuleSet);
@@ -3044,7 +3144,7 @@ mod tests {
         };
 
         let result = set
-            .match_rules(&meta, &rules)
+            .match_rules(&meta, &rules, &|_| true)
             .expect("domain rule must match");
         assert_eq!(result.adapter_name, "Broad");
         assert_eq!(result.rule_type, RuleType::DomainSuffix);
@@ -3067,7 +3167,7 @@ mod tests {
         counts.reset();
 
         let result = set
-            .match_rules(&Metadata::default(), &rules)
+            .match_rules(&Metadata::default(), &rules, &|_| true)
             .expect("counting rule must match");
 
         assert_eq!(result.adapter_name, "DIRECT");
@@ -3085,7 +3185,7 @@ mod tests {
 
         let set = CompiledRuleSet::build(&rules);
         let result = set
-            .match_rules(&Metadata::default(), &rules)
+            .match_rules(&Metadata::default(), &rules, &|_| true)
             .expect("sub-rule inner final must match");
 
         assert_eq!(result.adapter_name, "InnerProxy");
@@ -3109,10 +3209,10 @@ mod tests {
                 dst_port: 443,
                 ..Default::default()
             };
-            let legacy = match_engine::match_rules(&metadata, &rules, &index)
+            let legacy = match_engine::match_rules(&metadata, &rules, &index, &|_| true)
                 .map(|m| (m.adapter_name, m.rule_type, m.rule_payload));
             let compiled = compiled
-                .match_rules(&metadata, &rules)
+                .match_rules(&metadata, &rules, &|_| true)
                 .map(|m| (m.adapter_name, m.rule_type, m.rule_payload));
 
             assert_eq!(compiled, legacy, "metadata host={host}");
@@ -3140,10 +3240,10 @@ mod tests {
                 dst_port: 443,
                 ..Default::default()
             };
-            let legacy = match_engine::match_rules(&metadata, &rules, &index)
+            let legacy = match_engine::match_rules(&metadata, &rules, &index, &|_| true)
                 .map(|m| (m.adapter_name, m.rule_type, m.rule_payload));
             let compiled = compiled
-                .match_rules(&metadata, &rules)
+                .match_rules(&metadata, &rules, &|_| true)
                 .map(|m| (m.adapter_name, m.rule_type, m.rule_payload));
 
             assert_eq!(compiled, legacy, "metadata host={host}");
@@ -3204,10 +3304,10 @@ mod tests {
         ];
 
         for metadata in cases {
-            let legacy = match_engine::match_rules(&metadata, &rules, &index)
+            let legacy = match_engine::match_rules(&metadata, &rules, &index, &|_| true)
                 .map(|m| (m.adapter_name, m.rule_type, m.rule_payload));
             let compiled = compiled
-                .match_rules(&metadata, &rules)
+                .match_rules(&metadata, &rules, &|_| true)
                 .map(|m| (m.adapter_name, m.rule_type, m.rule_payload));
 
             assert_eq!(compiled, legacy, "metadata host={}", metadata.host);

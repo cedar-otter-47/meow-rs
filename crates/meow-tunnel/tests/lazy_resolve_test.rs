@@ -23,11 +23,30 @@ fn build_resolver_with_host(host: &str, ip: IpAddr) -> Arc<Resolver> {
     ))
 }
 
+/// A rule scan skips a match whose target is absent from the registry
+/// (issue #513), so these tests publish a registry that actually holds the
+/// names their rules target (`PROXY`, `DOM`) as direct-backed entries.
+fn tunnel_with_targets(resolver: Arc<Resolver>, names: &[&str]) -> Tunnel {
+    let raw = format!(
+        "proxies:\n{}\n",
+        names
+            .iter()
+            .map(|n| format!("  - name: {n}\n    type: direct"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    let cfg: meow_config::raw::RawConfig = serde_yaml::from_str(&raw).unwrap();
+    let (proxies, _) = meow_config::rebuild_from_raw(&cfg).unwrap();
+    let tunnel = Tunnel::new(resolver);
+    tunnel.update_proxies(proxies);
+    tunnel
+}
+
 #[tokio::test]
 async fn lazy_resolves_ip_when_scan_reaches_ipcidr_rule() {
     let real_ip = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
     let resolver = build_resolver_with_host("example.test", real_ip);
-    let tunnel = Tunnel::new(resolver);
+    let tunnel = tunnel_with_targets(resolver, &["PROXY", "DOM"]);
 
     let rules: Vec<Box<dyn Rule>> = vec![
         Box::new(IpCidrRule::new("1.2.3.0/24", "PROXY", false, false).unwrap()),
@@ -58,7 +77,7 @@ async fn lazy_resolves_ip_when_scan_reaches_ipcidr_rule() {
 async fn lazy_skips_dns_when_domain_rule_matches_first() {
     let real_ip = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
     let resolver = build_resolver_with_host("example.test", real_ip);
-    let tunnel = Tunnel::new(resolver);
+    let tunnel = tunnel_with_targets(resolver, &["PROXY", "DOM"]);
 
     let rules: Vec<Box<dyn Rule>> = vec![
         Box::new(DomainSuffixRule::new("example.test", "DOM")),
@@ -89,7 +108,7 @@ async fn lazy_skips_dns_when_domain_rule_matches_first() {
 async fn lazy_falls_through_to_final_when_nothing_matches() {
     let real_ip = IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9));
     let resolver = build_resolver_with_host("example.test", real_ip);
-    let tunnel = Tunnel::new(resolver);
+    let tunnel = tunnel_with_targets(resolver, &["PROXY", "DOM"]);
 
     let rules: Vec<Box<dyn Rule>> = vec![
         Box::new(IpCidrRule::new("1.2.3.0/24", "PROXY", false, false).unwrap()),

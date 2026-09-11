@@ -164,12 +164,12 @@ fn rule_match_zero_alloc_on_hot_path() {
     };
 
     // Warm up
-    let _ = match_rules(&meta, &rules, &index);
+    let _ = match_rules(&meta, &rules, &index, &|_| true);
 
     reset_counts();
     let n = 1000;
     for _ in 0..n {
-        let result = match_rules(&meta, &rules, &index);
+        let result = match_rules(&meta, &rules, &index, &|_| true);
         let _ = std::hint::black_box(result);
     }
     let (allocs, _) = snapshot();
@@ -243,25 +243,25 @@ fn rule_engine_pressure_zero_alloc_free_on_critical_path() {
 
     // Warm up any lazy test/runtime state outside the measured critical path.
     assert_eq!(
-        match_rules(&domain_hit, &rules, &index)
+        match_rules(&domain_hit, &rules, &index, &|_| true)
             .expect("domain suffix rule should match")
             .adapter_name,
         "直连"
     );
     assert_eq!(
-        match_rules(&geosite_hit, &rules, &index)
+        match_rules(&geosite_hit, &rules, &index, &|_| true)
             .expect("GEOSITE github rule should match")
             .adapter_name,
         "Github"
     );
     assert_eq!(
-        match_rules(&geoip_hit, &rules, &index)
+        match_rules(&geoip_hit, &rules, &index, &|_| true)
             .expect("GEOIP CN rule should match")
             .adapter_name,
         "国内"
     );
     assert_eq!(
-        match_rules(&full_scan_final, &rules, &index)
+        match_rules(&full_scan_final, &rules, &index, &|_| true)
             .expect("final rule should match")
             .adapter_name,
         "其他"
@@ -273,21 +273,25 @@ fn rule_engine_pressure_zero_alloc_free_on_critical_path() {
             std::hint::black_box(&domain_hit),
             std::hint::black_box(&rules),
             std::hint::black_box(&index),
+            &|_| true,
         );
         let geosite = match_rules(
             std::hint::black_box(&geosite_hit),
             std::hint::black_box(&rules),
             std::hint::black_box(&index),
+            &|_| true,
         );
         let geoip = match_rules(
             std::hint::black_box(&geoip_hit),
             std::hint::black_box(&rules),
             std::hint::black_box(&index),
+            &|_| true,
         );
         let full_scan = match_rules(
             std::hint::black_box(&full_scan_final),
             std::hint::black_box(&rules),
             std::hint::black_box(&index),
+            &|_| true,
         );
         std::hint::black_box((domain, geosite, geoip, full_scan));
     }

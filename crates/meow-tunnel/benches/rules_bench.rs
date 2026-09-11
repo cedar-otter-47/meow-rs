@@ -187,10 +187,10 @@ fn assert_matchers_agree(
     case: &BenchCase,
 ) {
     let linear = scan_linear(rules, &case.metadata);
-    let indexed = match_rules(&case.metadata, rules, index)
+    let indexed = match_rules(&case.metadata, rules, index, &|_| true)
         .map(|m| (m.adapter_name, m.rule_type, m.rule_payload));
     let ir = compiled
-        .match_rules(&case.metadata, rules)
+        .match_rules(&case.metadata, rules, &|_| true)
         .map(|m| (m.adapter_name, m.rule_type, m.rule_payload));
 
     assert_eq!(indexed, linear, "indexed diverged for {}", case.name);
@@ -224,12 +224,15 @@ fn bench_case_group(
                 black_box(&case.metadata),
                 black_box(rules),
                 black_box(index),
+                &|_| true,
             ))
         });
     });
 
     group.bench_function(BenchmarkId::new("after_ir", case.name), |b| {
-        b.iter(|| black_box(compiled.match_rules(black_box(&case.metadata), black_box(rules))));
+        b.iter(|| {
+            black_box(compiled.match_rules(black_box(&case.metadata), black_box(rules), &|_| true))
+        });
     });
 
     group.finish();
