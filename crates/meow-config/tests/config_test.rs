@@ -21,6 +21,131 @@ mixed-port: 7890
 }
 
 #[tokio::test]
+async fn test_proxy_group_forward_reference_preserves_nested_group() {
+    let yaml = r#"
+proxies:
+  - name: node-a
+    type: socks5
+    server: 127.0.0.1
+    port: 10001
+  - name: node-b
+    type: socks5
+    server: 127.0.0.1
+    port: 10002
+
+proxy-groups:
+  - name: upper-selector
+    type: select
+    proxies:
+      - failover
+      # Preserve the existing lenient behavior in the referencing group too.
+      - missing-upper-member
+  - name: failover
+    type: fallback
+    url: https://www.gstatic.com/generate_204
+    interval: 300
+    proxies:
+      - node-a
+      - node-b
+      # This missing member prevented the referenced group from resolving in
+      # the strict pass and triggered the forward-reference regression.
+      - missing-fallback-member
+"#;
+
+    let config = load_config_from_str(yaml).await.unwrap();
+    let selector = config
+        .proxies
+        .get("upper-selector")
+        .expect("forward-referencing selector must be built");
+    let fallback = config
+        .proxies
+        .get("failover")
+        .expect("referenced fallback group must be built");
+
+    assert_eq!(selector.members().unwrap(), ["failover"]);
+    assert_eq!(selector.current().as_deref(), Some("failover"));
+    assert_eq!(fallback.members().unwrap(), ["node-a", "node-b"]);
+    assert_eq!(fallback.current().as_deref(), Some("node-a"));
+}
+
+#[tokio::test]
+async fn test_forward_group_reference_uses_group_when_leaf_has_same_name() {
+    let yaml = r#"
+proxies:
+  - name: child
+    type: socks5
+    server: 127.0.0.1
+    port: 10001
+  - name: node-a
+    type: socks5
+    server: 127.0.0.1
+    port: 10002
+
+proxy-groups:
+  - name: parent
+    type: select
+    proxies:
+      - child
+  - name: child
+    type: select
+    proxies:
+      - node-a
+"#;
+
+    let config = load_config_from_str(yaml).await.unwrap();
+    let parent = config.proxies.get("parent").expect("parent must be built");
+    let child = config
+        .proxies
+        .get("child")
+        .expect("child group must replace the same-named leaf");
+    let parent_member = parent
+        .unwrap_proxy(&meow_common::Metadata::default())
+        .expect("parent must select its child member");
+
+    assert!(
+        std::sync::Arc::ptr_eq(&parent_member, child),
+        "parent must retain the child group, not the superseded same-named leaf"
+    );
+}
+
+#[tokio::test]
+async fn test_missing_member_preserves_include_all_proxy_snapshot_timing() {
+    let yaml = r#"
+proxies:
+  - name: node-a
+    type: socks5
+    server: 127.0.0.1
+    port: 10001
+
+proxy-groups:
+  - name: aggregate
+    type: select
+    include-all-proxies: true
+    proxies:
+      - missing-node
+  - name: later
+    type: select
+    proxies:
+      - node-a
+"#;
+
+    let config = load_config_from_str(yaml).await.unwrap();
+    let aggregate = config
+        .proxies
+        .get("aggregate")
+        .expect("aggregate must be built leniently");
+
+    assert!(
+        aggregate
+            .members()
+            .expect("aggregate must expose its members")
+            .iter()
+            .any(|name| name == "later"),
+        "a missing static member must not make include-all-proxies snapshot the registry early"
+    );
+}
+
+#[tokio::test]
 async fn test_general_config_table() {
     struct Case {
         label: &'static str,
