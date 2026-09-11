@@ -109,6 +109,43 @@ proxy-groups:
 }
 
 #[tokio::test]
+async fn test_missing_member_preserves_include_all_proxy_snapshot_timing() {
+    let yaml = r#"
+proxies:
+  - name: node-a
+    type: socks5
+    server: 127.0.0.1
+    port: 10001
+
+proxy-groups:
+  - name: aggregate
+    type: select
+    include-all-proxies: true
+    proxies:
+      - missing-node
+  - name: later
+    type: select
+    proxies:
+      - node-a
+"#;
+
+    let config = load_config_from_str(yaml).await.unwrap();
+    let aggregate = config
+        .proxies
+        .get("aggregate")
+        .expect("aggregate must be built leniently");
+
+    assert!(
+        aggregate
+            .members()
+            .expect("aggregate must expose its members")
+            .iter()
+            .any(|name| name == "later"),
+        "a missing static member must not make include-all-proxies snapshot the registry early"
+    );
+}
+
+#[tokio::test]
 async fn test_general_config_table() {
     struct Case {
         label: &'static str,

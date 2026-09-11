@@ -884,6 +884,16 @@ fn primary_global_target<'a>(
         .find(|name| is_usable_global_target(name, proxies))
 }
 
+fn has_unresolved_group_dependency(
+    group: &raw::RawProxyGroup,
+    declared_group_names: &std::collections::HashSet<&str>,
+    built_group_names: &std::collections::HashSet<SmolStr>,
+) -> bool {
+    group.proxies.as_deref().unwrap_or(&[]).iter().any(|name| {
+        declared_group_names.contains(name.as_str()) && !built_group_names.contains(name.as_str())
+    })
+}
+
 fn rebuild_from_raw_impl(
     raw: &raw::RawConfig,
     cache_dir: Option<&Path>,
@@ -971,19 +981,51 @@ fn rebuild_from_raw_impl(
     while !remaining.is_empty() && max_passes > 0 {
         max_passes -= 1;
         let mut still_remaining = Vec::new();
+        let mut strict_progress = false;
         for raw_group in &remaining {
-            let has_unresolved_group =
-                raw_group
-                    .proxies
-                    .as_deref()
-                    .unwrap_or(&[])
-                    .iter()
-                    .any(|name| {
-                        declared_group_names.contains(name.as_str())
-                            && !built_group_names.contains(name.as_str())
-                    });
-            if has_unresolved_group {
+            if has_unresolved_group_dependency(raw_group, &declared_group_names, &built_group_names)
+            {
                 still_remaining.push(*raw_group);
+                continue;
+            }
+
+            match proxy_parser::parse_proxy_group_with_store(
+                raw_group,
+                &proxies,
+                providers,
+                selector_store,
+            ) {
+                Ok(group) => {
+                    let name = SmolStr::from(group.name());
+                    built_group_names.insert(name.clone());
+                    proxies.insert(name, group);
+                    strict_progress = true;
+                }
+                Err(_) => {
+                    still_remaining.push(*raw_group);
+                }
+            }
+        }
+
+        if still_remaining.is_empty() {
+            break;
+        }
+        if strict_progress {
+            remaining = still_remaining;
+            continue;
+        }
+
+        // Strict parsing stalled. Leniently build only groups whose declared
+        // group dependencies are ready, then resume strict passes. This keeps
+        // missing static members from blocking forward group references while
+        // preserving the existing build timing for groups that can resolve
+        // strictly (notably include-all-proxies registry snapshots).
+        let mut lenient_remaining = Vec::new();
+        let mut lenient_progress = false;
+        for raw_group in &still_remaining {
+            if has_unresolved_group_dependency(raw_group, &declared_group_names, &built_group_names)
+            {
+                lenient_remaining.push(*raw_group);
                 continue;
             }
 
@@ -997,18 +1039,21 @@ fn rebuild_from_raw_impl(
                     let name = SmolStr::from(group.name());
                     built_group_names.insert(name.clone());
                     proxies.insert(name, group);
+                    lenient_progress = true;
                 }
                 Err(_) => {
-                    still_remaining.push(*raw_group);
+                    lenient_remaining.push(*raw_group);
                 }
             }
         }
-        if still_remaining.len() == remaining.len() {
-            // No progress — preserve meow-rs's existing lenient behavior by
-            // warning about unresolved members and building each group with
-            // whatever resolved. Unlike mihomo, which rejects missing static
-            // members, meow-rs does not fail the entire config here.
-            for raw_group in &still_remaining {
+
+        if !lenient_progress {
+            // No strict or dependency-aware lenient progress is possible.
+            // Preserve meow-rs's final fallback: warn about unresolved members
+            // and build each group with whatever resolved. Unlike mihomo,
+            // which rejects missing static members, meow-rs does not fail the
+            // entire config here.
+            for raw_group in &lenient_remaining {
                 match proxy_parser::parse_proxy_group_lenient_with_store(
                     raw_group,
                     &proxies,
@@ -1024,7 +1069,7 @@ fn rebuild_from_raw_impl(
             }
             break;
         }
-        remaining = still_remaining;
+        remaining = lenient_remaining;
     }
 
     // Auto-create GLOBAL selector if not defined by user (mihomo compatibility).

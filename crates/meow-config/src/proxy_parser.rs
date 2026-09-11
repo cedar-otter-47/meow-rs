@@ -2425,10 +2425,11 @@ pub fn parse_proxy_group_with_store(
 
 /// Lenient variant: unknown members are warned and skipped rather than
 /// erroring out. The multi-pass group resolver uses the corresponding
-/// with-store variant once every declared group dependency has been built,
-/// and again on its final stall pass. This preserves meow-rs's existing
-/// missing-member behavior; mihomo instead rejects a group whose static member
-/// name is missing.
+/// with-store variant when strict resolution stalls and every declared group
+/// dependency has been built, and again on its final fallback when no further
+/// progress is possible. This preserves meow-rs's existing missing-member
+/// behavior; mihomo instead rejects a group whose static member name is
+/// missing.
 pub fn parse_proxy_group_lenient(
     config: &crate::raw::RawProxyGroup,
     existing_proxies: &HashMap<SmolStr, Arc<dyn Proxy>>,
