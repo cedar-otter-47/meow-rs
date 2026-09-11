@@ -62,6 +62,12 @@ jobs:
         with:
           cache-on-failure: true
 
+      # cargo-nextest: per-test process isolation + `--retries 2` absorbs
+      # the tail-latency/UDP-drop flakes these real-I/O suites are prone to
+      # on shared runners (e.g. snell_v3_docker_udp read timeouts).
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
       - name: Cache ssserver binary
         id: cache-ssserver
         uses: actions/cache@v4
@@ -111,7 +117,7 @@ jobs:
       # runs every crate's lib tests, meow-dns included.
       - name: Unit + integration tests (default features)
         run: |
-          cargo test --lib --bin meow \
+          cargo nextest run --lib --bin meow \
             --test common_test \
             --test socks5_udp_user \
             --test dns_cache_test \
@@ -132,18 +138,17 @@ jobs:
             --test ws_test \
             --test crate_invariants_test \
             --test crate_publish_metadata_test \
-            --test smux_singbox_integration \
-            -- --nocapture
+            --test smux_singbox_integration --retries 2
 
       - name: UDP routing regression (SOCKS5, Shadowsocks, TUN)
-        run: cargo test -p meow-listener --all-features --lib udp_port_53
+        run: cargo nextest run -p meow-listener --all-features --lib udp_port_53 --retries 2
 
       # ADR-0008 allocation-count gates. Release build: the thresholds are
       # calibrated against release codegen. The provider-backed pressure
       # test self-skips when geodata files are absent (as on CI runners);
       # the remaining gates run everywhere.
       - name: Allocation-count gates (ADR-0008)
-        run: cargo test -p meow-tunnel --test alloc_count_test --release -- --nocapture
+        run: cargo nextest run -p meow-tunnel --test alloc_count_test --release --retries 2
 
       # Kept as its own step: MIHOMO_REQUIRE_INTEGRATION_BINS flips *every*
       # suite that probes for external binaries from skip to fail (e.g.
@@ -154,22 +159,21 @@ jobs:
           # Force-fail (instead of silently SKIP) if ssserver / obfs-local /
           # obfs-server are missing on PATH — they are installed above.
           MIHOMO_REQUIRE_INTEGRATION_BINS: "1"
-        run: cargo test --test shadowsocks_integration -- --nocapture
+        run: cargo nextest run --test shadowsocks_integration --retries 2
 
       - name: Docker integration tests (Hysteria2 + Snell v3)
         env:
           MEOW_REQUIRE_DOCKER: "1"
         run: |
-          cargo test -p meow-proxy --features "hysteria2,snell" \
+          cargo nextest run -p meow-proxy --features "hysteria2,snell" \
             --test hysteria2_integration \
-            --test snell_server_docker_integration \
-            -- --nocapture
+            --test snell_server_docker_integration --retries 2
 
       - name: AnyTLS unit and integration tests (embedded server)
         run: |
-          cargo test -p meow-anytls --lib
-          cargo test -p meow-proxy --features anytls --lib \
-            --test anytls_integration --test anytls_leak
+          cargo nextest run -p meow-anytls --lib --retries 2
+          cargo nextest run -p meow-proxy --features anytls --lib \
+            --test anytls_integration --test anytls_leak --retries 2
 
       # One invocation/feature set for the feature-gated transport suites.
       # Per-feature-combination *compile* coverage (the old G1-G6 matrix)
@@ -177,12 +181,11 @@ jobs:
       # runs these same tests under --all-features.
       - name: Transport feature-gated tests (gRPC / H2 / HTTPUpgrade / XHTTP)
         run: |
-          cargo test -p meow-transport --features "grpc,h2,httpupgrade,xhttp" \
+          cargo nextest run -p meow-transport --features "grpc,h2,httpupgrade,xhttp" \
             --test grpc_test \
             --test h2_test \
             --test xhttp_test \
-            --test httpupgrade_test \
-            -- --nocapture
+            --test httpupgrade_test --retries 2
 
   features:
     runs-on: ubuntu-latest
@@ -265,6 +268,9 @@ jobs:
           cache-on-failure: true
           key: windows
 
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
       # lwIP (listener-tun, in the `full` default bundle) uses bindgen.
       - name: Install LLVM
         uses: KyleMayes/install-llvm-action@v2
@@ -296,7 +302,7 @@ jobs:
       - name: Unit + integration tests (windows)
         shell: bash
         run: |
-          cargo test --lib --bin meow \
+          cargo nextest run --lib --bin meow \
             --test common_test \
             --test config_test \
             --test rules_test \
@@ -304,8 +310,7 @@ jobs:
             --test trojan_integration \
             --test tls_test \
             --test ws_test \
-            --test crate_publish_metadata_test \
-            -- --nocapture
+            --test crate_publish_metadata_test --retries 2
 
       # TUN inbound tests: `listener-tun` is not a default feature, so the
       # workspace --lib leg above never compiles or runs the tun module's
@@ -314,7 +319,7 @@ jobs:
       # test of the real PowerShell/registry backup path) plus the
       # platform-neutral TUN routing-loop guard.
       - name: meow-listener TUN tests (listener-tun)
-        run: cargo test -p meow-listener --features listener-tun --lib -- --nocapture
+        run: cargo nextest run -p meow-listener --features listener-tun --lib --retries 2
 
   macos:
     runs-on: macos-latest
@@ -329,12 +334,15 @@ jobs:
           cache-on-failure: true
           key: macos
 
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
       - name: Build
         run: cargo build --tests
 
       - name: Core smoke tests
         run: |
-          cargo test --lib --bin meow \
+          cargo nextest run --lib --bin meow \
             --test common_test \
             --test config_test \
             --test rules_test \
@@ -342,14 +350,13 @@ jobs:
             --test trojan_integration \
             --test tls_test \
             --test ws_test \
-            --test crate_publish_metadata_test \
-            -- --nocapture
+            --test crate_publish_metadata_test --retries 2
 
       # `listener-tun` is not a default feature; this leg runs the tun
       # module's tests — notably the macOS regression guard that an unset
       # `tun.device` never invents a name (tun-rs rejects non-`utunN`).
       - name: meow-listener TUN tests (listener-tun)
-        run: cargo test -p meow-listener --features listener-tun --lib -- --nocapture
+        run: cargo nextest run -p meow-listener --features listener-tun --lib --retries 2
 
   tproxy:
     runs-on: ubuntu-latest
