@@ -272,11 +272,15 @@ fn process_missing(metadata: &Metadata) -> bool {
 }
 
 /// Log a skipped match: the rule matched but its target is absent from the
-/// registry. Interpolated into the message itself because the /logs
-/// broadcast forwards only the `message` field (issue #513).
+/// registry or unusable for this traffic (issue #513; mihomo's match loop
+/// also `continue`s a target without UDP support on UDP flows).
+/// Interpolated into the message itself because the /logs broadcast
+/// forwards only the `message` field.
 fn warn_missing_target(m: &CompiledMatchResult<'_>) {
     warn!(
-        "rule {} matched target '{}' which is not in the registry; skipping it",
+        "rule {} matched target '{}' which is unavailable for this \
+         connection (absent from the registry, or no UDP support); \
+         skipping it",
         m.rule_type.as_str(),
         m.adapter_name,
     );

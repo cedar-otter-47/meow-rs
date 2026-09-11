@@ -2,7 +2,7 @@ use crate::match_engine::{self, DomainIndex};
 use crate::rule_ir::{CompiledMatchResult, CompiledRuleSet, LazyMatchOutcome};
 use crate::statistics::Statistics;
 use crate::udp::{self, NatTable};
-use meow_common::{Metadata, Proxy, ProxyAdapter, Rule, TunnelMode};
+use meow_common::{Metadata, Network, Proxy, ProxyAdapter, Rule, TunnelMode};
 use meow_dns::Resolver;
 use meow_proxy::DirectAdapter;
 use parking_lot::RwLock;
@@ -200,7 +200,7 @@ impl TunnelInner {
                 let result = route.compiled_rules.match_rules(
                     match_metadata,
                     route.rules.as_ref(),
-                    &|name| name == "DIRECT" || route.proxies.contains_key(name),
+                    &Self::target_usable(&route, match_metadata),
                 );
                 Some(self.materialize_rule_match(&route, result))
             }
@@ -229,11 +229,11 @@ impl TunnelInner {
         // Owned `Arc` snapshot: the enrichment arm holds it across an
         // `.await`, which a lock guard must never do.
         let route = self.route();
+        let usable = Self::target_usable(&route, metadata);
         match route
             .compiled_rules
-            .match_rules_lazy(metadata, route.rules.as_ref(), &|name| {
-                name == "DIRECT" || route.proxies.contains_key(name)
-            }) {
+            .match_rules_lazy(metadata, route.rules.as_ref(), &usable)
+        {
             LazyMatchOutcome::Matched(m) => Some(self.materialize_rule_match(&route, Some(m))),
             LazyMatchOutcome::NoMatch => Some(self.materialize_rule_match(&route, None)),
             LazyMatchOutcome::NeedsEnrichment {
@@ -263,10 +263,27 @@ impl TunnelInner {
                 let result = route.compiled_rules.match_rules(
                     match_metadata,
                     route.rules.as_ref(),
-                    &|name| name == "DIRECT" || route.proxies.contains_key(name),
+                    &Self::target_usable(&route, match_metadata),
                 );
                 Some(self.materialize_rule_match(&route, result))
             }
+        }
+    }
+
+    /// Registry-membership predicate for the match engines (issue #513
+    /// `continue` semantics). Mirrors mihomo's `match()` loop exactly: the
+    /// scan skips a matched rule whose target is absent — and, for UDP
+    /// flows, whose adapter lacks `support_udp` (upstream's second
+    /// `continue` at `!adapter.SupportUDP()`). `DIRECT` is hard-coded as
+    /// always usable: the tunnel owns that adapter unconditionally.
+    fn target_usable<'a>(route: &'a RouteTable, metadata: &Metadata) -> impl Fn(&str) -> bool + 'a {
+        let is_udp = metadata.network == Network::Udp;
+        move |name| {
+            name == "DIRECT"
+                || route
+                    .proxies
+                    .get(name)
+                    .is_some_and(|p| !is_udp || p.support_udp())
         }
     }
 

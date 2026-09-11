@@ -193,3 +193,43 @@ fn no_rule_matching_still_falls_through_to_direct() {
         "the fall-through is not a rule match and must not be counted as one"
     );
 }
+
+/// mihomo's `match()` runs a second `continue` for UDP flows: a matched rule
+/// whose target lacks `SupportUDP()` is skipped, not dialed to failure.
+#[test]
+fn udp_flow_skips_a_target_without_udp_support() {
+    let yaml =
+        "proxies:\n  - name: TCP-ONLY\n    type: http\n    server: 127.0.0.1\n    port: 8080\n";
+    let raw: meow_config::raw::RawConfig = serde_yaml::from_str(yaml).unwrap();
+    let (proxies, _) = meow_config::rebuild_from_raw(&raw).expect("http node parses");
+
+    let tunnel = Tunnel::new(resolver());
+    tunnel.update_proxies(proxies);
+    tunnel.set_mode(TunnelMode::Rule);
+    let rules: Vec<Box<dyn Rule>> = vec![
+        Box::new(meow_rules::domain::DomainRule::new(
+            "example.test",
+            "TCP-ONLY",
+        )),
+        Box::new(FinalRule::new("REJECT")),
+    ];
+    tunnel.update_rules(rules);
+
+    let mut udp_meta = metadata();
+    udp_meta.network = Network::Udp;
+    let (proxy, rule, _payload) = tunnel
+        .inner()
+        .resolve_proxy(&udp_meta)
+        .expect("the later rule must win");
+
+    // TCP flow still lands on the http adapter; UDP flow skips to REJECT —
+    // exactly upstream's `!adapter.SupportUDP()` continue.
+    assert_eq!(rule, "MATCH");
+    assert_eq!(proxy.adapter_type(), AdapterType::Reject);
+
+    let (tcp_proxy, _r, _p) = tunnel
+        .inner()
+        .resolve_proxy(&metadata())
+        .expect("tcp resolves");
+    assert_eq!(tcp_proxy.adapter_type(), AdapterType::Http);
+}
