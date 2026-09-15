@@ -814,7 +814,7 @@ fn apply_dialer_proxies(
 /// build would miss both.
 ///
 /// Conservative over-approximations, all fail-closed: `include-all-proxies`
-/// expands to the final registry (the build itself saw a mid-pass subset);
+/// expands to the successfully parsed top-level `proxies:` entries;
 /// duplicate group declarations are unioned (the registry keeps the last
 /// *successful* build, not the last declaration); relay members are all
 /// treated as reachable heads (only the first member's dialer can actually
@@ -824,6 +824,7 @@ fn reject_group_membership_cycles(
     edges: &[(SmolStr, SmolStr)],
     raw_groups: &[raw::RawProxyGroup],
     proxies: &HashMap<SmolStr, Arc<dyn Proxy>>,
+    include_all_proxy_names: &std::collections::HashSet<SmolStr>,
     global_auto_created: bool,
 ) -> Result<(), anyhow::Error> {
     if edges.is_empty() {
@@ -845,7 +846,12 @@ fn reject_group_membership_cycles(
             .filter(|m| proxies.contains_key(*m))
             .collect();
         if group.include_all_proxies.unwrap_or(false) {
-            members.extend(proxies.keys().map(SmolStr::as_str));
+            members.extend(
+                include_all_proxy_names
+                    .iter()
+                    .filter(|name| proxies.contains_key(name.as_str()))
+                    .map(SmolStr::as_str),
+            );
         }
         members_of
             .entry(group.name.as_str())
@@ -979,6 +985,7 @@ fn rebuild_from_raw_impl(
 ) -> Result<RebuildResult, anyhow::Error> {
     let ipv6 = effective_ipv6(raw.ipv6);
     let mut proxies: HashMap<SmolStr, Arc<dyn Proxy>> = HashMap::new();
+    let mut static_proxy_names = std::collections::HashSet::new();
     // `dialer-proxy` front hops are resolved by name against this registry on
     // every dial; it is published once the build below has finished.
     let registry = meow_proxy::dialer::ProxyRegistry::default();
@@ -1023,6 +1030,7 @@ fn rebuild_from_raw_impl(
                     .and_then(|v| v.as_str())
                     .unwrap_or_else(|| proxy.name())
                     .into();
+                static_proxy_names.insert(key.clone());
                 proxies.insert(key, proxy);
             }
             Err(e) => warn!("Failed to parse proxy: {}", e),
@@ -1043,6 +1051,23 @@ fn rebuild_from_raw_impl(
         &registry,
         ipv6,
     )?;
+
+    // Mihomo expands `include-all-proxies` from the top-level `proxies:`
+    // entries only. Capture those adapters after dialer wrapping but before
+    // any groups enter the registry, and keep mihomo's name-sorted order.
+    let mut include_all_proxies: Vec<(SmolStr, Arc<dyn Proxy>)> = static_proxy_names
+        .iter()
+        .filter_map(|name| {
+            proxies
+                .get(name.as_str())
+                .map(|proxy| (name.clone(), Arc::clone(proxy)))
+        })
+        .collect();
+    include_all_proxies.sort_by(|(left, _), (right, _)| left.cmp(right));
+    let include_all_proxies: Vec<Arc<dyn Proxy>> = include_all_proxies
+        .into_iter()
+        .map(|(_, proxy)| proxy)
+        .collect();
 
     // Multi-pass group resolution: groups can reference other groups.
     // Keep trying until no new groups are resolved.
@@ -1066,6 +1091,7 @@ fn rebuild_from_raw_impl(
             match proxy_parser::parse_proxy_group_with_store(
                 raw_group,
                 &proxies,
+                &include_all_proxies,
                 providers,
                 selector_store,
             ) {
@@ -1106,6 +1132,7 @@ fn rebuild_from_raw_impl(
             match proxy_parser::parse_proxy_group_lenient_with_store(
                 raw_group,
                 &proxies,
+                &include_all_proxies,
                 providers,
                 selector_store,
             ) {
@@ -1131,6 +1158,7 @@ fn rebuild_from_raw_impl(
                 match proxy_parser::parse_proxy_group_lenient_with_store(
                     raw_group,
                     &proxies,
+                    &include_all_proxies,
                     providers,
                     selector_store,
                 ) {
@@ -1175,6 +1203,7 @@ fn rebuild_from_raw_impl(
         match proxy_parser::parse_proxy_group_with_store(
             &global_config,
             &proxies,
+            &[],
             providers,
             selector_store,
         ) {
@@ -1208,7 +1237,13 @@ fn rebuild_from_raw_impl(
     // Cycles that run through group membership — including a declared-but-
     // failed GLOBAL that the auto-create just backstopped — are only decidable
     // now that the registry is finished.
-    reject_group_membership_cycles(&dialer_edges, raw_groups, &proxies, global_auto_created)?;
+    reject_group_membership_cycles(
+        &dialer_edges,
+        raw_groups,
+        &proxies,
+        &static_proxy_names,
+        global_auto_created,
+    )?;
 
     // Publish the finished registry: the `dialer-proxy` chains bound above
     // resolve their front hop by name against it, and only now does it hold the
@@ -2533,7 +2568,18 @@ mod dialer_proxy_tests {
                 .or_insert_with(|| simple_proxy(&group.name));
         }
         let global_auto_created = !proxies.contains_key("GLOBAL");
-        reject_group_membership_cycles(&edges, raw_groups, proxies, global_auto_created)?;
+        let include_all_proxy_names = raw_proxies
+            .iter()
+            .filter_map(|proxy| proxy.get("name").and_then(serde_yaml::Value::as_str))
+            .map(SmolStr::from)
+            .collect();
+        reject_group_membership_cycles(
+            &edges,
+            raw_groups,
+            proxies,
+            &include_all_proxy_names,
+            global_auto_created,
+        )?;
         registry.publish(Arc::new(proxies.clone()));
         Ok(())
     }
@@ -2679,7 +2725,7 @@ mod dialer_proxy_tests {
         );
     }
 
-    /// `include-all-proxies` expands to every registry name — same self-route.
+    /// `include-all-proxies` expands to every top-level proxy — same self-route.
     #[test]
     fn include_all_proxies_group_is_a_config_error() {
         let mut proxies = registry(&["A", "B"]);
